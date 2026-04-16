@@ -14,7 +14,9 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS")
 
 # Tekshirish
 if not TOKEN or not SHEET_ID or not GOOGLE_CREDENTIALS_JSON:
-    raise ValueError("Iltimos, Railwayda quyidagi environment variable'larni sozlang: BOT_TOKEN, SHEET_ID, GOOGLE_CREDENTIALS")
+    error_msg = "Iltimos, Railwayda quyidagi environment variable'larni sozlang:\n"
+    error_msg += "BOT_TOKEN, SHEET_ID, GOOGLE_CREDENTIALS"
+    raise ValueError(error_msg)
 
 # Google Sheets ulanish (JSON string dan)
 try:
@@ -59,7 +61,6 @@ def get_random_incorrect(correct_word, all_words, lang='eng'):
         candidates = [w[1] for w in all_words if w[1] != correct_word]
     
     if len(candidates) < 3:
-        # Agar kam so'z bo'lsa, o'zini takrorlashga ruxsat
         candidates = candidates * 3
     return random.sample(candidates, min(3, len(candidates)))
 
@@ -255,7 +256,8 @@ async def menu_callback(update: Update, context):
 
 # ---------- ASOSIY ----------
 def main():
-    app = Application.builder().token(TOKEN).build()
+    # Application yaratish
+    application = Application.builder().token(TOKEN).build()
     
     # So'z qo'shish conversation
     add_conv = ConversationHandler(
@@ -266,18 +268,20 @@ def main():
         },
         fallbacks=[CommandHandler('cancel', add_cancel)],
     )
-    app.add_handler(add_conv)
+    application.add_handler(add_conv)
     
     # Handlerlar
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(menu_callback, pattern='^menu$'))
-    app.add_handler(CallbackQueryHandler(list_words, pattern='^list$'))
-    app.add_handler(CallbackQueryHandler(test_mode, pattern='^test$'))
-    app.add_handler(CallbackQueryHandler(next_question_callback, pattern='^next_question$'))
-    app.add_handler(CallbackQueryHandler(check_answer, pattern='^ans_'))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern='^menu$'))
+    application.add_handler(CallbackQueryHandler(list_words, pattern='^list$'))
+    application.add_handler(CallbackQueryHandler(test_mode, pattern='^test$'))
+    application.add_handler(CallbackQueryHandler(next_question_callback, pattern='^next_question$'))
+    application.add_handler(CallbackQueryHandler(check_answer, pattern='^ans_'))
     
     print("🤖 Bot ishga tushdi...")
-    app.run_polling()
+    
+    # Start polling
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
