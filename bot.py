@@ -41,6 +41,7 @@ ENGLISH, UZBEK = range(2)
 
 WORDS_SHEET_NAME = "words"
 RESULTS_SHEET_NAME = "results"
+PROGRESS_SHEET_NAME = "progress"
 
 GLOBAL_WORDS_PAGE_SIZE = 20
 MY_WORDS_PAGE_SIZE = 20
@@ -52,7 +53,7 @@ LAST_FETCH = 0
 CACHE_TTL = 300  # 5 minut
 
 GLOBAL_TEST_MAX_QUESTIONS = 25
-GLOBAL_TEST_MAX_WORDS = GLOBAL_TEST_MAX_QUESTIONS // 2  # 12 ta word -> 24 ta savol
+MY_TEST_MAX_QUESTIONS = 25
 
 
 # =========================
@@ -116,6 +117,20 @@ results_sheet = ensure_worksheet(
         "percent",
         "score",
         "created_at",
+    ],
+)
+
+progress_sheet = ensure_worksheet(
+    PROGRESS_SHEET_NAME,
+    [
+        "user_id",
+        "english",
+        "uzbek",
+        "seen_count",
+        "correct_count",
+        "wrong_count",
+        "last_result",
+        "updated_at",
     ],
 )
 
@@ -388,6 +403,171 @@ def get_user_total_global_score(user_id: int) -> int:
         return 0
 
 
+def get_progress_records():
+    try:
+        return progress_sheet.get_all_records()
+    except Exception as e:
+        logger.exception("get_progress_records error: %s", e)
+        return []
+
+
+def get_user_progress_map(user_id: int) -> dict:
+    records = get_progress_records()
+    progress_map = {}
+
+    for row in records:
+        row_user_id = normalize_text(str(row.get("user_id", "")))
+        if row_user_id != str(user_id):
+            continue
+
+        english = normalize_text(row.get("english"))
+        uzbek = normalize_text(row.get("uzbek"))
+        if not english or not uzbek:
+            continue
+
+        key = f"{english.lower()}::{uzbek.lower()}"
+        progress_map[key] = {
+            "seen_count": int(float(str(row.get("seen_count", 0)) or 0)),
+            "correct_count": int(float(str(row.get("correct_count", 0)) or 0)),
+            "wrong_count": int(float(str(row.get("wrong_count", 0)) or 0)),
+            "last_result": normalize_text(row.get("last_result")),
+        }
+
+    return progress_map
+
+
+def update_word_progress(
+    user_id: int,
+    english: str,
+    uzbek: str,
+    is_correct: bool,
+):
+    try:
+        records = progress_sheet.get_all_records()
+
+        target_row_index = None
+        english_l = normalize_text(english).lower()
+        uzbek_l = normalize_text(uzbek).lower()
+
+        for idx, row in enumerate(records, start=2):
+            row_user_id = normalize_text(str(row.get("user_id", "")))
+            row_english = normalize_text(row.get("english")).lower()
+            row_uzbek = normalize_text(row.get("uzbek")).lower()
+
+            if row_user_id == str(user_id) and row_english == english_l and row_uzbek == uzbek_l:
+                target_row_index = idx
+                break
+
+        if target_row_index is None:
+            seen_count = 1
+            correct_count = 1 if is_correct else 0
+            wrong_count = 0 if is_correct else 1
+            last_result = "correct" if is_correct else "wrong"
+
+            progress_sheet.append_row(
+                [
+                    str(user_id),
+                    english,
+                    uzbek,
+                    str(seen_count),
+                    str(correct_count),
+                    str(wrong_count),
+                    last_result,
+                    now_str(),
+                ]
+            )
+            return
+
+        current_seen = int(float(str(progress_sheet.cell(target_row_index, 4).value or 0)))
+        current_correct = int(float(str(progress_sheet.cell(target_row_index, 5).value or 0)))
+        current_wrong = int(float(str(progress_sheet.cell(target_row_index, 6).value or 0)))
+
+        new_seen = current_seen + 1
+        new_correct = current_correct + (1 if is_correct else 0)
+        new_wrong = current_wrong + (0 if is_correct else 1)
+        new_last_result = "correct" if is_correct else "wrong"
+
+        progress_sheet.update(
+            f"D{target_row_index}:H{target_row_index}",
+            [[
+                str(new_seen),
+                str(new_correct),
+                str(new_wrong),
+                new_last_result,
+                now_str(),
+            ]]
+        )
+
+    except Exception as e:
+        logger.exception("update_word_progress error: %s", e)
+
+
+def build_weighted_words(words: list[dict], user_id: int, limit: int | None = None) -> list[dict]:
+    if not words:
+        return []
+
+    progress_map = get_user_progress_map(user_id)
+    pool = []
+
+    for word in words:
+        english = normalize_text(word["english"])
+        uzbek = normalize_text(word["uzbek"])
+        key = f"{english.lower()}::{uzbek.lower()}"
+
+        stats = progress_map.get(
+            key,
+            {
+                "seen_count": 0,
+                "correct_count": 0,
+                "wrong_count": 0,
+                "last_result": "",
+            },
+        )
+
+        wrong_count = stats["wrong_count"]
+        correct_count = stats["correct_count"]
+        last_result = stats["last_result"]
+
+        weight = 1 + wrong_count * 3 - correct_count * 0.5
+        if last_result == "wrong":
+            weight += 2
+
+        weight = max(1, int(round(weight)))
+
+        for _ in range(weight):
+            pool.append(word)
+
+    random.shuffle(pool)
+
+    selected = []
+    seen_keys = set()
+
+    for word in pool:
+        key = f"{normalize_text(word['english']).lower()}::{normalize_text(word['uzbek']).lower()}"
+        if key in seen_keys:
+            continue
+        selected.append(word)
+        seen_keys.add(key)
+
+        if limit is not None and len(selected) >= limit:
+            break
+
+    if limit is not None and len(selected) < min(limit, len(words)):
+        remaining = []
+        for word in words:
+            key = f"{normalize_text(word['english']).lower()}::{normalize_text(word['uzbek']).lower()}"
+            if key not in seen_keys:
+                remaining.append(word)
+
+        random.shuffle(remaining)
+        for word in remaining:
+            selected.append(word)
+            if len(selected) >= min(limit, len(words)):
+                break
+
+    return selected
+
+
 def get_random_incorrect(correct_word, all_words, lang="eng"):
     if lang == "eng":
         candidates = [w["english"] for w in all_words if normalize_text(w["english"]) != normalize_text(correct_word)]
@@ -404,19 +584,15 @@ def get_random_incorrect(correct_word, all_words, lang="eng"):
 
     return candidates
 
+
 def build_test_queue(words: list[dict]) -> list[dict]:
     queue = []
 
     for word in words:
-        # 🔥 har bir word uchun RANDOM direction
-        if random.random() < 0.5:
-            q_type = "eng2uz"
-        else:
-            q_type = "uz2eng"
-
+        q_type = "eng2uz" if random.random() < 0.5 else "uz2eng"
         queue.append({
             "q_type": q_type,
-            "correct": word
+            "correct": word,
         })
 
     random.shuffle(queue)
@@ -510,13 +686,19 @@ def build_rules_text():
         "Ushbu bot inglizcha-o'zbekcha so'zlarni o'rganish va test ishlash uchun yaratilgan.\n\n"
         "🌍 Global test\n"
         "Bu bo'limda barcha foydalanuvchilar qo'shgan so'zlardan test ishlanadi.\n"
-        "Siz o'zingiz qo'shgan so'zlar ham shu testda chiqishi mumkin.\n"
-        "Faqat Global test uchun ball beriladi va Leaderboard shu bo'lim asosida shakllanadi.\n"
-        f"Global test maksimal {GLOBAL_TEST_MAX_QUESTIONS} ta savol bilan cheklanadi.\n\n"
+        "Har bir so'zdan faqat 1 ta savol tushadi. Ya'ni bir so'z uchun inglizcha yoki o'zbekcha tomoni random tanlanadi.\n"
+        f"Global test maksimal {GLOBAL_TEST_MAX_QUESTIONS} ta savol bilan cheklanadi.\n"
+        "Agar testni oxirigacha ishlamasdan Menyu tugmasi bilan chiqib ketsangiz ham, ishlangan qism natijasi saqlanadi.\n"
+        "Faqat Global test uchun ball beriladi va Leaderboard shu bo'lim asosida shakllanadi.\n\n"
         "👤 Mening testim\n"
         "Bu bo'limda faqat siz qo'shgan so'zlardan test ishlaysiz.\n"
+        "Har bir so'zdan faqat 1 ta savol tushadi.\n"
         "Bu mashq rejimi hisoblanadi va ball qo'shilmaydi.\n"
-        "Test tugagach, xato ishlangan savollarni qayta ishlash mumkin.\n\n"
+        "Bot smart repetition mantiqidan foydalanadi: siz ko'proq xato qilgan so'zlar keyingi testlarda ko'proq tushadi.\n"
+        "Test tugagach, xato ishlangan savollarni alohida qayta ishlash mumkin.\n\n"
+        "❌ Xatolarni qayta ishlash\n"
+        "Mening testim tugagandan keyin xato javob bergan savollar uchun alohida knopka chiqadi.\n"
+        "Bu bo'limda faqat xato ishlangan savollar qayta beriladi.\n\n"
         "➕ So'z qo'shish\n"
         "Yangi inglizcha-o'zbekcha so'z juftligini botga qo'shishingiz mumkin.\n"
         "Har bir inglizcha so'z faqat 1 marta, har bir o'zbekcha so'z ham faqat 1 marta kiritiladi.\n\n"
@@ -527,10 +709,8 @@ def build_rules_text():
         "🏆 Leaderboard\n"
         "Bu bo'limda Global test bo'yicha barcha foydalanuvchilar ballari saralangan holda ko'rsatiladi.\n\n"
         "Test tartibi:\n"
-        "Har bir so'z testda 2 xil ko'rinishda ishlatiladi:\n"
-        "1. Inglizcha → O'zbekcha\n"
-        "2. O'zbekcha → Inglizcha\n\n"
-        "Har bir variant faqat 1 martadan beriladi.\n"
+        "Savolda ko'rinadigan so'zlar kichik harflarda chiqariladi.\n"
+        "Har bir savolda 1 ta to'g'ri javob va bir nechta random variant bo'ladi.\n"
         "Barcha savollar tugagach, test yakunlanadi va natija ko'rsatiladi.\n\n"
         "Taklif va murojaatlar uchun:\n"
         "@abdurahmon_2909"
@@ -696,10 +876,16 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
             f"🏅 Ushbu test uchun ball: {correct}\n"
             f"🔥 Umumiy global ballingiz: {total_global_score}"
         )
-    elif test_mode_type in {"my", "my_retry"}:
-        title = "✅ Mening testim tugadi!" if test_mode_type == "my" else "✅ Xato savollar testi tugadi!"
+    elif test_mode_type == "my":
         text = (
-            f"{title}\n\n"
+            "✅ Mening testim tugadi!\n\n"
+            f"📊 Natija: {correct}/{total}\n"
+            f"📈 Foiz: {percent}%\n\n"
+            "Bu mashq rejimi, ball qo'shilmadi."
+        )
+    elif test_mode_type == "my_retry":
+        text = (
+            "✅ Xato savollar testi tugadi!\n\n"
             f"📊 Natija: {correct}/{total}\n"
             f"📈 Foiz: {percent}%\n\n"
             "Bu mashq rejimi, ball qo'shilmadi."
@@ -935,7 +1121,7 @@ async def global_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     selected_words = words[:]
     random.shuffle(selected_words)
-    selected_words = selected_words[:GLOBAL_TEST_MAX_WORDS]
+    selected_words = selected_words[:min(GLOBAL_TEST_MAX_QUESTIONS, len(selected_words))]
 
     context.user_data["test_words"] = selected_words
     context.user_data["score"] = {"total": 0, "correct": 0}
@@ -964,9 +1150,15 @@ async def my_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    context.user_data["test_words"] = words
+    selected_words = build_weighted_words(
+        words,
+        user_id=user_id,
+        limit=min(MY_TEST_MAX_QUESTIONS, len(words)),
+    )
+
+    context.user_data["test_words"] = selected_words
     context.user_data["score"] = {"total": 0, "correct": 0}
-    context.user_data["test_queue"] = build_test_queue(words)
+    context.user_data["test_queue"] = build_test_queue(selected_words)
     context.user_data["test_mode_type"] = "my"
     context.user_data["wrong_answers"] = []
     context.user_data["global_partial_saved"] = False
@@ -988,7 +1180,7 @@ async def retry_wrong_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    retry_queue = wrongs.copy()
+    retry_queue = wrongs[:]
     random.shuffle(retry_queue)
 
     context.user_data["test_words"] = [item["correct"] for item in retry_queue]
@@ -1038,11 +1230,6 @@ async def generate_question(
             )
         return
 
-    if context.user_data.get("test_mode_type") == "my_retry" and not test_queue:
-        if query:
-            await finish_test(query, context, update)
-        return
-
     if not test_queue:
         if query:
             await finish_test(query, context, update)
@@ -1075,9 +1262,7 @@ async def generate_question(
 
     keyboard = []
     for i, opt in enumerate(options):
-        keyboard.append([
-            InlineKeyboardButton(opt.lower(), callback_data=f"{prefix}{i}")
-        ])
+        keyboard.append([InlineKeyboardButton(opt.lower(), callback_data=f"{prefix}{i}")])
 
     keyboard.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
 
@@ -1117,6 +1302,7 @@ async def generate_question(
                 final_text,
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
+
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1182,9 +1368,20 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["wrong_answers"] = wrong_answers
 
         if q_type == "eng2uz":
-            feedback_text = f"❌ Xato!\nTo'g'ri javob: {correct['english']} -> {correct['uzbek']}"
+            feedback_text = f"❌ Xato!\nTo'g'ri javob: {correct['english'].lower()} -> {correct['uzbek'].lower()}"
         else:
-            feedback_text = f"❌ Xato!\nTo'g'ri javob: {correct['uzbek']} -> {correct['english']}"
+            feedback_text = f"❌ Xato!\nTo'g'ri javob: {correct['uzbek'].lower()} -> {correct['english'].lower()}"
+
+    test_mode_type = context.user_data.get("test_mode_type")
+    if test_mode_type in {"my", "my_retry"}:
+        user_id, _, _ = get_user_meta(update)
+        if user_id is not None:
+            update_word_progress(
+                user_id=user_id,
+                english=correct["english"],
+                uzbek=correct["uzbek"],
+                is_correct=is_correct,
+            )
 
     await generate_question(update, context, query, feedback_text=feedback_text)
 
