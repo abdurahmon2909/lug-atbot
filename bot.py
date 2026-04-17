@@ -43,6 +43,7 @@ RESULTS_SHEET_NAME = "results"
 
 GLOBAL_WORDS_PAGE_SIZE = 20
 MY_WORDS_PAGE_SIZE = 20
+LEADERBOARD_PAGE_SIZE = 20
 TOP_LIMIT = 5
 
 WORDS_CACHE = []
@@ -80,7 +81,6 @@ def ensure_worksheet(name: str, headers: list[str]):
         if not current_headers:
             ws.append_row(headers)
         else:
-            # header yetishmasa minimal xavfsiz update
             for idx, header in enumerate(headers, start=1):
                 if idx > len(current_headers) or current_headers[idx - 1] != header:
                     ws.update_cell(1, idx, header)
@@ -205,7 +205,6 @@ def add_word(eng: str, uzb: str, user_id: int, username: str | None, full_name: 
             existing_eng = row["english"].strip().lower()
             existing_uzb = row["uzbek"].strip().lower()
 
-            # Har bir english faqat 1 marta, har bir uzbek ham faqat 1 marta
             if existing_eng == eng_lower or existing_uzb == uzb_lower:
                 return "exists"
 
@@ -257,7 +256,7 @@ def save_global_result(
         logger.exception("save_global_result error: %s", e)
 
 
-def get_top_users(limit: int = TOP_LIMIT):
+def get_leaderboard_users():
     try:
         records = results_sheet.get_all_records()
         score_map = {}
@@ -289,17 +288,20 @@ def get_top_users(limit: int = TOP_LIMIT):
 
             score_map[user_id_raw]["score"] += score
 
-            # username/full_name bo'sh bo'lsa keyin yangilash
             if username and not score_map[user_id_raw]["username"]:
                 score_map[user_id_raw]["username"] = username
             if full_name and not score_map[user_id_raw]["full_name"]:
                 score_map[user_id_raw]["full_name"] = full_name
 
-        top = sorted(score_map.values(), key=lambda x: x["score"], reverse=True)
-        return top[:limit]
+        leaderboard = sorted(score_map.values(), key=lambda x: x["score"], reverse=True)
+        return leaderboard
     except Exception as e:
-        logger.exception("get_top_users error: %s", e)
+        logger.exception("get_leaderboard_users error: %s", e)
         return []
+
+
+def get_top_users(limit: int = TOP_LIMIT):
+    return get_leaderboard_users()[:limit]
 
 
 def get_user_total_global_score(user_id: int) -> int:
@@ -399,6 +401,35 @@ def format_words_page(title: str, words: list[dict], page: int, page_size: int, 
     return text, page
 
 
+def format_leaderboard_page(users: list[dict], page: int, page_size: int):
+    total_items = len(users)
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+
+    if page < 0:
+        page = 0
+    if page >= total_pages:
+        page = total_pages - 1
+
+    start = page * page_size
+    end = start + page_size
+    chunk = users[start:end]
+
+    text = "🏆 Leaderboard\n"
+    text += f"📄 Sahifa: {page + 1}/{total_pages}\n"
+    text += f"👥 Jami foydalanuvchilar: {total_items}\n\n"
+
+    if not chunk:
+        text += "Hozircha reyting bo'sh."
+        return text, page
+
+    for idx, item in enumerate(chunk, start=start + 1):
+        user_id_val = int(item["user_id"]) if str(item["user_id"]).isdigit() else None
+        name = get_display_name(user_id_val, item.get("username"), item.get("full_name"))
+        text += f"{idx}. {name} — {item['score']}\n"
+
+    return text, page
+
+
 def build_rules_text():
     return (
         "ℹ️ Bot qoidalari va ishlash tartibi\n\n"
@@ -406,7 +437,7 @@ def build_rules_text():
         "🌍 Global test\n"
         "Bu bo'limda barcha foydalanuvchilar qo'shgan so'zlardan test ishlanadi.\n"
         "Siz o'zingiz qo'shgan so'zlar ham shu testda chiqishi mumkin.\n"
-        "Faqat Global test uchun ball beriladi va Top 5 reyting shu bo'lim asosida shakllanadi.\n\n"
+        "Faqat Global test uchun ball beriladi va Leaderboard shu bo'lim asosida shakllanadi.\n\n"
         "👤 Mening testim\n"
         "Bu bo'limda faqat siz qo'shgan so'zlardan test ishlaysiz.\n"
         "Bu mashq rejimi hisoblanadi va ball qo'shilmaydi.\n\n"
@@ -417,8 +448,8 @@ def build_rules_text():
         "Bu yerda siz qo'shgan so'zlarni ko'rasiz.\n\n"
         "🌐 Global so'zlar\n"
         "Bu bo'limda barcha foydalanuvchilar qo'shgan so'zlar sahifalarga bo'lingan holda ko'rsatiladi.\n\n"
-        "🏆 Top 5\n"
-        "Bu bo'limda Global test bo'yicha eng yuqori ball to'plagan foydalanuvchilar ko'rsatiladi.\n\n"
+        "🏆 Leaderboard\n"
+        "Bu bo'limda Global test bo'yicha barcha foydalanuvchilar ballari saralangan holda ko'rsatiladi.\n\n"
         "Test tartibi:\n"
         "Har bir so'z testda 2 xil ko'rinishda ishlatiladi:\n"
         "1. Inglizcha → O'zbekcha\n"
@@ -464,7 +495,7 @@ def get_main_menu_markup() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("➕ So'z qo'shish", callback_data="add")],
         [InlineKeyboardButton("📚 Mening so'zlarim", callback_data="my_words_0")],
         [InlineKeyboardButton("🌐 Global so'zlar", callback_data="global_words_0")],
-        [InlineKeyboardButton("🏆 Top 5", callback_data="top5")],
+        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard_0")],
         [InlineKeyboardButton("ℹ️ Qoidalar", callback_data="rules")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -549,8 +580,30 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
 # =========================
 # HANDLERS
 # =========================
+async def restart_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_test_state(context)
+    context.user_data.pop("eng", None)
+
+    if update.message:
+        await update.message.reply_text(
+            get_start_text(),
+            reply_markup=get_main_menu_markup(),
+        )
+    elif update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        await safe_edit_or_send(
+            query,
+            get_start_text(),
+            reply_markup=get_main_menu_markup(),
+        )
+
+    return ConversationHandler.END
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_test_state(context)
+    context.user_data.pop("eng", None)
     await update.message.reply_text(
         get_start_text(),
         reply_markup=get_main_menu_markup(),
@@ -561,34 +614,25 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     clear_test_state(context)
+    context.user_data.pop("eng", None)
     await safe_edit_or_send(query, get_start_text(), reply_markup=get_main_menu_markup())
 
 
-async def top5_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def leaderboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    top_users = get_top_users(TOP_LIMIT)
-    text = "🏆 Our Top 5 Vocab Pros\n\n"
+    data = query.data
+    page = 0
+    try:
+        page = int(data.split("_")[-1])
+    except Exception:
+        page = 0
 
-    if top_users:
-        for i, user in enumerate(top_users, start=1):
-            name = get_display_name(
-                int(user["user_id"]) if str(user["user_id"]).isdigit() else None,
-                user.get("username"),
-                user.get("full_name"),
-            )
-            text += f"{i}. {name} — {user['score']}\n"
-    else:
-        text += "Hozircha reyting bo'sh."
-
-    await safe_edit_or_send(
-        query,
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]
-        ),
-    )
+    users = get_leaderboard_users()
+    text, page = format_leaderboard_page(users, page, LEADERBOARD_PAGE_SIZE)
+    markup = build_pagination_markup("leaderboard", page, len(users), LEADERBOARD_PAGE_SIZE)
+    await safe_edit_or_send(query, text, reply_markup=markup)
 
 
 async def rules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -606,7 +650,7 @@ async def rules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await safe_edit_or_send(query, "Inglizcha so'zni yozing:")
+    await safe_edit_or_send(query, "Inglizcha so'zni yozing:\n(Bekor qilish uchun /cancel yozing)")
     return ENGLISH
 
 
@@ -617,7 +661,7 @@ async def add_english(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ENGLISH
 
     context.user_data["eng"] = text
-    await update.message.reply_text("O'zbekcha tarjimasini yozing:")
+    await update.message.reply_text("O'zbekcha tarjimasini yozing:\n(Bekor qilish uchun /cancel yozing)")
     return UZBEK
 
 
@@ -637,13 +681,15 @@ async def add_uzbek(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = add_word(eng, uzb, user_id, username, full_name)
 
     if result == "ok":
-        await update.message.reply_text(f"✅ Qo'shildi: {eng} -> {uzb}")
+        await update.message.reply_text(f"✅ So'z qo'shildi!\n📝 {eng} -> {uzb}")
     elif result == "exists":
         await update.message.reply_text(
             "⚠️ Bu inglizcha yoki o'zbekcha so'z allaqachon mavjud!"
         )
     else:
         await update.message.reply_text("❌ Xatolik!")
+
+    context.user_data.pop("eng", None)
 
     await update.message.reply_text(
         "Yana tanlang:",
@@ -653,6 +699,9 @@ async def add_uzbek(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_test_state(context)
+    context.user_data.pop("eng", None)
+
     await update.message.reply_text(
         "Bekor qilindi.",
         reply_markup=get_main_menu_markup(),
@@ -749,8 +798,6 @@ async def repeat_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
 
-    # oldingi test turini saqlab qololmaymiz, chunki finishda clear bo'ladi
-    # shuning uchun qayta tanlashga yo'naltiramiz
     await safe_edit_or_send(
         query,
         "Qaysi testni qayta ishlamoqchisiz?",
@@ -904,8 +951,12 @@ def main():
             ENGLISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_english)],
             UZBEK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_uzbek)],
         },
-        fallbacks=[CommandHandler("cancel", add_cancel)],
+        fallbacks=[
+            CommandHandler("cancel", add_cancel),
+            CommandHandler("start", restart_to_menu),
+        ],
         per_message=True,
+        allow_reentry=True,
     )
 
     app.add_error_handler(error_handler)
@@ -919,7 +970,7 @@ def main():
     app.add_handler(CallbackQueryHandler(repeat_test_handler, pattern="^repeat_test$"))
     app.add_handler(CallbackQueryHandler(my_words_handler, pattern=r"^my_words_\d+$"))
     app.add_handler(CallbackQueryHandler(global_words_handler, pattern=r"^global_words_\d+$"))
-    app.add_handler(CallbackQueryHandler(top5_handler, pattern="^top5$"))
+    app.add_handler(CallbackQueryHandler(leaderboard_handler, pattern=r"^leaderboard_\d+$"))
     app.add_handler(CallbackQueryHandler(rules_handler, pattern="^rules$"))
     app.add_handler(CallbackQueryHandler(check_answer, pattern=r"^(eng_|uz_)"))
 
