@@ -874,7 +874,7 @@ async def generate_question(
     mode_title = "🌍 Global test" if context.user_data.get("test_mode_type") == "global" else "👤 Mening testim"
 
     score_text = (
-        f"{mode_title}\n\n"
+        f"{mode_title}\n"
         f"📊 {score['correct']}/{score['total']}\n"
         f"🧩 Qoldi: {remaining}\n\n"
     )
