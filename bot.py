@@ -5,6 +5,7 @@ import os
 import time
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -28,7 +29,7 @@ if not TOKEN or not SHEET_ID or not GOOGLE_CREDENTIALS_JSON:
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ try:
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
     sheet = client.open_by_key(SHEET_ID).worksheet("words")
-    print("✅ Google Sheets connected!")
+    print("✅ Google Sheetsga ulandi!")
 except Exception as e:
     print(f"❌ Google Sheets error: {e}")
     raise
@@ -54,6 +55,7 @@ ENGLISH, UZBEK = range(2)
 WORDS_CACHE = []
 LAST_FETCH = 0
 CACHE_TTL = 60  # sekund
+
 
 # ---------- YORDAMCHI FUNKSIYALAR ----------
 def get_main_menu_markup() -> InlineKeyboardMarkup:
@@ -105,17 +107,18 @@ def add_word(eng: str, uzb: str):
     try:
         words = get_all_words()
 
-        # duplicate check (case-insensitive)
         eng_lower = eng.lower()
         uzb_lower = uzb.lower()
 
         for existing_eng, existing_uzb in words:
-            if existing_eng.strip().lower() == eng_lower and existing_uzb.strip().lower() == uzb_lower:
+            if (
+                existing_eng.strip().lower() == eng_lower
+                and existing_uzb.strip().lower() == uzb_lower
+            ):
                 return "exists"
 
         sheet.append_row([eng, uzb])
 
-        # cache yangilash
         invalidate_cache()
         get_all_words(force_refresh=True)
 
@@ -140,22 +143,36 @@ def get_random_incorrect(correct_word, all_words, lang="eng"):
     if len(candidates) >= 3:
         return random.sample(candidates, 3)
 
-    # agar variant kam bo‘lsa, mavjudlarini qaytaradi
     return candidates
 
 
-async def safe_edit_or_send(query, text: str, reply_markup: InlineKeyboardMarkup | None = None):
+async def safe_edit_or_send(
+    query,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+):
     try:
         await query.edit_message_text(text=text, reply_markup=reply_markup)
     except Exception:
         await query.message.reply_text(text=text, reply_markup=reply_markup)
 
 
+async def post_init(application: Application):
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning("delete_webhook warning: %s", e)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception:", exc_info=context.error)
+
+
 # ---------- HANDLERS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Xush kelibsiz! Tanlang:",
-        reply_markup=get_main_menu_markup()
+        reply_markup=get_main_menu_markup(),
     )
 
 
@@ -167,14 +184,27 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_english(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["eng"] = update.message.text.strip()
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Iltimos, inglizcha so'zni yuboring.")
+        return ENGLISH
+
+    context.user_data["eng"] = text
     await update.message.reply_text("O'zbekcha tarjimasini yozing:")
     return UZBEK
 
 
 async def add_uzbek(update: Update, context: ContextTypes.DEFAULT_TYPE):
     eng = context.user_data.get("eng", "").strip()
-    uzb = update.message.text.strip()
+    uzb = (update.message.text or "").strip()
+
+    if not eng:
+        await update.message.reply_text("⚠️ Avval inglizcha so'zni kiriting.")
+        return ConversationHandler.END
+
+    if not uzb:
+        await update.message.reply_text("⚠️ O'zbekcha tarjimani kiriting.")
+        return UZBEK
 
     result = add_word(eng, uzb)
 
@@ -187,13 +217,16 @@ async def add_uzbek(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Yana tanlang:",
-        reply_markup=get_main_menu_markup()
+        reply_markup=get_main_menu_markup(),
     )
     return ConversationHandler.END
 
 
 async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bekor qilindi.")
+    await update.message.reply_text(
+        "Bekor qilindi.",
+        reply_markup=get_main_menu_markup(),
+    )
     return ConversationHandler.END
 
 
@@ -218,7 +251,11 @@ async def list_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{i}. {eng} - {uzb}\n"
 
     keyboard = [[InlineKeyboardButton("🔙 Menyu", callback_data="menu")]]
-    await safe_edit_or_send(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await safe_edit_or_send(
+        query,
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def test_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,7 +280,12 @@ async def test_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await generate_question(update, context, query)
 
 
-async def generate_question(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None, feedback_text: str = ""):
+async def generate_question(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    query=None,
+    feedback_text: str = "",
+):
     words = context.user_data.get("test_words", [])
 
     if len(words) < 4:
@@ -274,7 +316,6 @@ async def generate_question(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         options = wrongs + [correct[0]]
         prefix = "eng_"
 
-    # unique saqlash
     options = list(dict.fromkeys(options))
     random.shuffle(options)
 
@@ -293,11 +334,15 @@ async def generate_question(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     final_text += score_text + question_text
 
     if query:
-        await safe_edit_or_send(query, final_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await safe_edit_or_send(
+            query,
+            final_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
     else:
         await update.callback_query.message.reply_text(
             final_text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
 
@@ -313,7 +358,7 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_or_send(
             query,
             "⚠️ Test holati topilmadi. Qaytadan boshlang.",
-            reply_markup=get_main_menu_markup()
+            reply_markup=get_main_menu_markup(),
         )
         return
 
@@ -321,10 +366,10 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("eng_"):
         user_ans = data[4:]
-        is_correct = (user_ans == correct[0])
+        is_correct = user_ans == correct[0]
     else:
         user_ans = data[3:]
-        is_correct = (user_ans == correct[1])
+        is_correct = user_ans == correct[1]
 
     if is_correct:
         context.user_data["score"]["correct"] += 1
@@ -345,32 +390,51 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_or_send(
         query,
         "🏠 Asosiy menyu",
-        reply_markup=get_main_menu_markup()
+        reply_markup=get_main_menu_markup(),
     )
 
 
 # ---------- MAIN ----------
 def main():
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .concurrent_updates(False)
+        .post_init(post_init)
+        .build()
+    )
 
-    conv = ConversationHandler(
+    add_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(add_start, pattern="^add$")],
         states={
             ENGLISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_english)],
             UZBEK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_uzbek)],
         },
         fallbacks=[CommandHandler("cancel", add_cancel)],
+        per_message=True,
     )
 
-    app.add_handler(conv)
+    app.add_error_handler(error_handler)
+
+    app.add_handler(add_conv)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(menu, pattern="^menu$"))
     app.add_handler(CallbackQueryHandler(list_words, pattern="^list$"))
     app.add_handler(CallbackQueryHandler(test_mode, pattern="^test$"))
     app.add_handler(CallbackQueryHandler(check_answer, pattern=r"^(eng_|uz_)"))
 
-    print("🤖 Bot is running...")
-    app.run_polling()
+    print("🤖 Bot ishga tushdi...")
+
+    try:
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    except Conflict:
+        logger.error(
+            "409 Conflict: shu token bilan boshqa bot instance ham ishlayapti. "
+            "Railway/local botlardan bittasini to'xtating."
+        )
 
 
 if __name__ == "__main__":
