@@ -1050,12 +1050,12 @@ async def generate_question(
     context.user_data["q_type"] = q_type
 
     if q_type == "eng2uz":
-        question_text = f"❓ {correct['english']} = ?"
+        question_text = f"❓ {correct['english'].lower()} = ?"
         wrongs = get_random_incorrect(correct["uzbek"], words, "uz")
         options = wrongs + [correct["uzbek"]]
         prefix = "uz_"
     else:
-        question_text = f"❓ {correct['uzbek']} = ?"
+        question_text = f"❓ {correct['uzbek'].lower()} = ?"
         wrongs = get_random_incorrect(correct["english"], words, "eng")
         options = wrongs + [correct["english"]]
         prefix = "eng_"
@@ -1066,7 +1066,9 @@ async def generate_question(
 
     keyboard = []
     for i, opt in enumerate(options):
-        keyboard.append([InlineKeyboardButton(opt, callback_data=f"{prefix}{i}")])
+        keyboard.append([
+            InlineKeyboardButton(opt.lower(), callback_data=f"{prefix}{i}")
+        ])
 
     keyboard.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
 
@@ -1106,7 +1108,6 @@ async def generate_question(
                 final_text,
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
-
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
