@@ -4,9 +4,10 @@ import json
 import os
 import time
 from datetime import datetime
+from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import Conflict
+from telegram.error import Conflict, BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -48,7 +49,8 @@ TOP_LIMIT = 5
 
 WORDS_CACHE = []
 LAST_FETCH = 0
-CACHE_TTL = 60  # sekund
+CACHE_TTL = 300  # 5 minut
+
 
 # =========================
 # GOOGLE SHEETS
@@ -114,6 +116,7 @@ results_sheet = ensure_worksheet(
     ],
 )
 
+
 # =========================
 # YORDAMCHI FUNKSIYALAR
 # =========================
@@ -121,7 +124,19 @@ def now_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def normalize_text(value: Optional[str]) -> str:
+    return (value or "").strip()
+
+
+def build_full_name(first_name: Optional[str], last_name: Optional[str]) -> str:
+    parts = [normalize_text(first_name), normalize_text(last_name)]
+    return " ".join([p for p in parts if p]).strip()
+
+
 def get_display_name(user_id: int | None, username: str | None, full_name: str | None) -> str:
+    username = normalize_text(username)
+    full_name = normalize_text(full_name)
+
     if username:
         return f"@{username}"
     if full_name:
@@ -132,10 +147,28 @@ def get_display_name(user_id: int | None, username: str | None, full_name: str |
 
 
 def get_user_meta(update: Update):
-    tg_user = update.effective_user
-    user_id = tg_user.id if tg_user else None
-    username = tg_user.username if tg_user else None
-    full_name = tg_user.full_name if tg_user else None
+    user = None
+
+    if update.effective_user:
+        user = update.effective_user
+    elif update.callback_query and update.callback_query.from_user:
+        user = update.callback_query.from_user
+    elif update.message and update.message.from_user:
+        user = update.message.from_user
+
+    if not user:
+        return None, "", ""
+
+    user_id = user.id
+    username = normalize_text(getattr(user, "username", ""))
+
+    full_name = normalize_text(getattr(user, "full_name", ""))
+    if not full_name:
+        full_name = build_full_name(
+            getattr(user, "first_name", ""),
+            getattr(user, "last_name", ""),
+        )
+
     return user_id, username, full_name
 
 
@@ -147,23 +180,35 @@ def invalidate_cache():
 
 def get_all_words(force_refresh: bool = False):
     global WORDS_CACHE, LAST_FETCH
+
     try:
         now = time.time()
         if not force_refresh and WORDS_CACHE and (now - LAST_FETCH < CACHE_TTL):
             return WORDS_CACHE
 
-        records = words_sheet.get_all_records()
-        words = []
+        values = words_sheet.get_all_values()
+        if not values or len(values) < 2:
+            WORDS_CACHE = []
+            LAST_FETCH = now
+            return WORDS_CACHE
 
-        for row in records:
-            eng = str(row.get("english", "")).strip()
-            uzb = str(row.get("uzbek", "")).strip()
+        headers = [str(h).strip() for h in values[0]]
+        rows = values[1:]
+
+        words = []
+        for raw_row in rows:
+            row = {}
+            for idx, header in enumerate(headers):
+                row[header] = raw_row[idx] if idx < len(raw_row) else ""
+
+            eng = normalize_text(row.get("english"))
+            uzb = normalize_text(row.get("uzbek"))
             if not eng or not uzb:
                 continue
 
-            user_id_raw = row.get("added_by_user_id", "")
+            user_id_raw = normalize_text(row.get("added_by_user_id"))
             try:
-                added_by_user_id = int(str(user_id_raw).strip()) if str(user_id_raw).strip() else None
+                added_by_user_id = int(user_id_raw) if user_id_raw else None
             except Exception:
                 added_by_user_id = None
 
@@ -172,9 +217,9 @@ def get_all_words(force_refresh: bool = False):
                     "english": eng,
                     "uzbek": uzb,
                     "added_by_user_id": added_by_user_id,
-                    "added_by_username": str(row.get("added_by_username", "")).strip(),
-                    "added_by_full_name": str(row.get("added_by_full_name", "")).strip(),
-                    "created_at": str(row.get("created_at", "")).strip(),
+                    "added_by_username": normalize_text(row.get("added_by_username")),
+                    "added_by_full_name": normalize_text(row.get("added_by_full_name")),
+                    "created_at": normalize_text(row.get("created_at")),
                 }
             )
 
@@ -192,8 +237,10 @@ def get_user_words(user_id: int):
 
 
 def add_word(eng: str, uzb: str, user_id: int, username: str | None, full_name: str | None):
-    eng = eng.strip()
-    uzb = uzb.strip()
+    eng = normalize_text(eng)
+    uzb = normalize_text(uzb)
+    username = normalize_text(username)
+    full_name = normalize_text(full_name)
 
     try:
         words = get_all_words()
@@ -202,8 +249,8 @@ def add_word(eng: str, uzb: str, user_id: int, username: str | None, full_name: 
         uzb_lower = uzb.lower()
 
         for row in words:
-            existing_eng = row["english"].strip().lower()
-            existing_uzb = row["uzbek"].strip().lower()
+            existing_eng = normalize_text(row["english"]).lower()
+            existing_uzb = normalize_text(row["uzbek"]).lower()
 
             if existing_eng == eng_lower or existing_uzb == uzb_lower:
                 return "exists"
@@ -213,8 +260,8 @@ def add_word(eng: str, uzb: str, user_id: int, username: str | None, full_name: 
                 eng,
                 uzb,
                 str(user_id),
-                username or "",
-                full_name or "",
+                username,
+                full_name,
                 now_str(),
             ]
         )
@@ -238,12 +285,18 @@ def save_global_result(
     percent = round((correct / total) * 100, 1) if total > 0 else 0
     score = correct
 
+    username = normalize_text(username)
+    full_name = normalize_text(full_name)
+
     try:
+        if not full_name and not username:
+            full_name = f"User {user_id}"
+
         results_sheet.append_row(
             [
                 str(user_id),
-                username or "",
-                full_name or "",
+                username,
+                full_name,
                 "global",
                 str(total),
                 str(correct),
@@ -256,22 +309,30 @@ def save_global_result(
         logger.exception("save_global_result error: %s", e)
 
 
+def get_results_records():
+    try:
+        return results_sheet.get_all_records()
+    except Exception as e:
+        logger.exception("get_results_records error: %s", e)
+        return []
+
+
 def get_leaderboard_users():
     try:
-        records = results_sheet.get_all_records()
+        records = get_results_records()
         score_map = {}
 
         for row in records:
-            test_type = str(row.get("test_type", "")).strip().lower()
+            test_type = normalize_text(str(row.get("test_type", ""))).lower()
             if test_type != "global":
                 continue
 
-            user_id_raw = str(row.get("user_id", "")).strip()
-            username = str(row.get("username", "")).strip()
-            full_name = str(row.get("full_name", "")).strip()
+            user_id_raw = normalize_text(str(row.get("user_id", "")))
+            username = normalize_text(str(row.get("username", "")))
+            full_name = normalize_text(str(row.get("full_name", "")))
 
             try:
-                score = int(float(str(row.get("score", "0")).strip() or "0"))
+                score = int(float(normalize_text(str(row.get("score", "0"))) or "0"))
             except Exception:
                 score = 0
 
@@ -290,6 +351,7 @@ def get_leaderboard_users():
 
             if username and not score_map[user_id_raw]["username"]:
                 score_map[user_id_raw]["username"] = username
+
             if full_name and not score_map[user_id_raw]["full_name"]:
                 score_map[user_id_raw]["full_name"] = full_name
 
@@ -306,15 +368,15 @@ def get_top_users(limit: int = TOP_LIMIT):
 
 def get_user_total_global_score(user_id: int) -> int:
     try:
-        records = results_sheet.get_all_records()
+        records = get_results_records()
         total_score = 0
         for row in records:
-            test_type = str(row.get("test_type", "")).strip().lower()
-            row_user_id = str(row.get("user_id", "")).strip()
+            test_type = normalize_text(str(row.get("test_type", ""))).lower()
+            row_user_id = normalize_text(str(row.get("user_id", "")))
             if test_type != "global" or row_user_id != str(user_id):
                 continue
             try:
-                total_score += int(float(str(row.get("score", "0")).strip() or "0"))
+                total_score += int(float(normalize_text(str(row.get("score", "0"))) or "0"))
             except Exception:
                 pass
         return total_score
@@ -325,9 +387,9 @@ def get_user_total_global_score(user_id: int) -> int:
 
 def get_random_incorrect(correct_word, all_words, lang="eng"):
     if lang == "eng":
-        candidates = [w["english"] for w in all_words if w["english"] != correct_word]
+        candidates = [w["english"] for w in all_words if normalize_text(w["english"]) != normalize_text(correct_word)]
     else:
-        candidates = [w["uzbek"] for w in all_words if w["uzbek"] != correct_word]
+        candidates = [w["uzbek"] for w in all_words if normalize_text(w["uzbek"]) != normalize_text(correct_word)]
 
     candidates = list(dict.fromkeys(candidates))
 
@@ -510,11 +572,37 @@ def get_after_test_markup():
     )
 
 
+async def safe_answer_callback(query):
+    if not query:
+        return False
+
+    try:
+        await query.answer()
+        return True
+    except BadRequest as e:
+        logger.warning("Callback answer warning: %s", e)
+        return False
+    except Exception as e:
+        logger.warning("Callback answer unexpected warning: %s", e)
+        return False
+
+
 async def safe_edit_or_send(query, text: str, reply_markup: InlineKeyboardMarkup | None = None):
+    if not query:
+        return
+
     try:
         await query.edit_message_text(text=text, reply_markup=reply_markup)
-    except Exception:
+        return
+    except BadRequest as e:
+        logger.warning("edit_message_text warning: %s", e)
+    except Exception as e:
+        logger.warning("edit_message_text unexpected warning: %s", e)
+
+    try:
         await query.message.reply_text(text=text, reply_markup=reply_markup)
+    except Exception as e:
+        logger.exception("reply_text error: %s", e)
 
 
 async def post_init(application: Application):
@@ -536,6 +624,7 @@ def clear_test_state(context: ContextTypes.DEFAULT_TYPE):
         "q_type",
         "test_queue",
         "current_question",
+        "current_options",
         "test_mode_type",
     ]:
         context.user_data.pop(key, None)
@@ -550,7 +639,7 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
 
     user_id, username, full_name = get_user_meta(update)
 
-    if test_mode_type == "global":
+    if test_mode_type == "global" and user_id is not None:
         save_global_result(user_id, username, full_name, total, correct)
         total_global_score = get_user_total_global_score(user_id)
 
@@ -577,6 +666,7 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
         reply_markup=get_after_test_markup(),
     )
 
+
 # =========================
 # HANDLERS
 # =========================
@@ -591,7 +681,7 @@ async def restart_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif update.callback_query:
         query = update.callback_query
-        await query.answer()
+        await safe_answer_callback(query)
         await safe_edit_or_send(
             query,
             get_start_text(),
@@ -612,7 +702,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
     clear_test_state(context)
     context.user_data.pop("eng", None)
     await safe_edit_or_send(query, get_start_text(), reply_markup=get_main_menu_markup())
@@ -620,7 +710,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def leaderboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     data = query.data
     page = 0
@@ -637,7 +727,7 @@ async def leaderboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def rules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
     await safe_edit_or_send(
         query,
         build_rules_text(),
@@ -649,13 +739,13 @@ async def rules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
     await safe_edit_or_send(query, "Inglizcha so'zni yozing:\n(Bekor qilish uchun /cancel yozing)")
     return ENGLISH
 
 
 async def add_english(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
+    text = normalize_text(update.message.text if update.message else "")
     if not text:
         await update.message.reply_text("Iltimos, inglizcha so'zni yuboring.")
         return ENGLISH
@@ -666,8 +756,8 @@ async def add_english(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_uzbek(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    eng = context.user_data.get("eng", "").strip()
-    uzb = (update.message.text or "").strip()
+    eng = normalize_text(context.user_data.get("eng", ""))
+    uzb = normalize_text(update.message.text if update.message else "")
 
     if not eng:
         await update.message.reply_text("⚠️ Avval inglizcha so'zni kiriting.")
@@ -678,6 +768,10 @@ async def add_uzbek(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return UZBEK
 
     user_id, username, full_name = get_user_meta(update)
+    if user_id is None:
+        await update.message.reply_text("❌ Foydalanuvchi ma'lumoti topilmadi.")
+        return ConversationHandler.END
+
     result = add_word(eng, uzb, user_id, username, full_name)
 
     if result == "ok":
@@ -711,7 +805,7 @@ async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def my_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     data = query.data
     page = 0
@@ -721,7 +815,7 @@ async def my_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = 0
 
     user_id, _, _ = get_user_meta(update)
-    words = get_user_words(user_id)
+    words = get_user_words(user_id) if user_id is not None else []
 
     text, page = format_words_page("📚 Mening so'zlarim", words, page, MY_WORDS_PAGE_SIZE, show_owner=False)
     markup = build_pagination_markup("my_words", page, len(words), MY_WORDS_PAGE_SIZE)
@@ -730,7 +824,7 @@ async def my_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def global_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     data = query.data
     page = 0
@@ -747,7 +841,7 @@ async def global_words_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def global_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     words = get_all_words()
 
@@ -771,10 +865,10 @@ async def global_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def my_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     user_id, _, _ = get_user_meta(update)
-    words = get_user_words(user_id)
+    words = get_user_words(user_id) if user_id is not None else []
 
     if len(words) < 4:
         await safe_edit_or_send(
@@ -796,7 +890,7 @@ async def my_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def repeat_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     await safe_edit_or_send(
         query,
@@ -859,10 +953,11 @@ async def generate_question(
 
     options = list(dict.fromkeys(options))
     random.shuffle(options)
+    context.user_data["current_options"] = options
 
     keyboard = []
-    for opt in options:
-        keyboard.append([InlineKeyboardButton(opt, callback_data=f"{prefix}{opt}")])
+    for i, opt in enumerate(options):
+        keyboard.append([InlineKeyboardButton(opt, callback_data=f"{prefix}{i}")])
 
     keyboard.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
 
@@ -891,21 +986,34 @@ async def generate_question(
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
     else:
-        await update.callback_query.message.reply_text(
-            final_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        if update.callback_query and update.callback_query.message:
+            await update.callback_query.message.reply_text(
+                final_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
 
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+
+    answered = await safe_answer_callback(query)
+    if not answered:
+        return
+
+    if "current_question" not in context.user_data:
+        await safe_edit_or_send(
+            query,
+            "⚠️ Test holati topilmadi. Qaytadan boshlang.",
+            reply_markup=get_main_menu_markup(),
+        )
+        return
 
     data = query.data
     correct = context.user_data.get("correct")
     q_type = context.user_data.get("q_type")
+    options = context.user_data.get("current_options", [])
 
-    if not correct or not q_type:
+    if not correct or not q_type or not options:
         await safe_edit_or_send(
             query,
             "⚠️ Test holati topilmadi. Qaytadan boshlang.",
@@ -915,12 +1023,24 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["score"]["total"] += 1
 
-    if data.startswith("eng_"):
-        user_ans = data[4:]
-        is_correct = user_ans == correct["english"]
-    else:
-        user_ans = data[3:]
-        is_correct = user_ans == correct["uzbek"]
+    try:
+        if data.startswith("eng_"):
+            index = int(data[4:])
+            user_ans = options[index]
+            is_correct = user_ans == correct["english"]
+        elif data.startswith("uz_"):
+            index = int(data[3:])
+            user_ans = options[index]
+            is_correct = user_ans == correct["uzbek"]
+        else:
+            raise ValueError("Unknown callback prefix")
+    except Exception:
+        await safe_edit_or_send(
+            query,
+            "⚠️ Javobni qayta ishlashda xatolik. Qaytadan boshlang.",
+            reply_markup=get_main_menu_markup(),
+        )
+        return
 
     if is_correct:
         context.user_data["score"]["correct"] += 1
@@ -932,6 +1052,7 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             feedback_text = f"❌ Xato!\nTo'g'ri javob: {correct['uzbek']} -> {correct['english']}"
 
     await generate_question(update, context, query, feedback_text=feedback_text)
+
 
 # =========================
 # MAIN
@@ -955,7 +1076,6 @@ def main():
             CommandHandler("cancel", add_cancel),
             CommandHandler("start", restart_to_menu),
         ],
-        
         allow_reentry=True,
     )
 
@@ -972,7 +1092,7 @@ def main():
     app.add_handler(CallbackQueryHandler(global_words_handler, pattern=r"^global_words_\d+$"))
     app.add_handler(CallbackQueryHandler(leaderboard_handler, pattern=r"^leaderboard_\d+$"))
     app.add_handler(CallbackQueryHandler(rules_handler, pattern="^rules$"))
-    app.add_handler(CallbackQueryHandler(check_answer, pattern=r"^(eng_|uz_)"))
+    app.add_handler(CallbackQueryHandler(check_answer, pattern=r"^(eng_|uz_)\d+$"))
 
     print("🤖 Bot ishga tushdi...")
 
