@@ -955,7 +955,7 @@ def main():
             CommandHandler("cancel", add_cancel),
             CommandHandler("start", restart_to_menu),
         ],
-        per_message=True,
+        
         allow_reentry=True,
     )
 
