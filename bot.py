@@ -51,6 +51,9 @@ WORDS_CACHE = []
 LAST_FETCH = 0
 CACHE_TTL = 300  # 5 minut
 
+GLOBAL_TEST_MAX_QUESTIONS = 25
+GLOBAL_TEST_MAX_WORDS = GLOBAL_TEST_MAX_QUESTIONS // 2  # 12 ta word -> 24 ta savol
+
 
 # =========================
 # GOOGLE SHEETS
@@ -499,10 +502,12 @@ def build_rules_text():
         "🌍 Global test\n"
         "Bu bo'limda barcha foydalanuvchilar qo'shgan so'zlardan test ishlanadi.\n"
         "Siz o'zingiz qo'shgan so'zlar ham shu testda chiqishi mumkin.\n"
-        "Faqat Global test uchun ball beriladi va Leaderboard shu bo'lim asosida shakllanadi.\n\n"
+        "Faqat Global test uchun ball beriladi va Leaderboard shu bo'lim asosida shakllanadi.\n"
+        f"Global test maksimal {GLOBAL_TEST_MAX_QUESTIONS} ta savol bilan cheklanadi.\n\n"
         "👤 Mening testim\n"
         "Bu bo'limda faqat siz qo'shgan so'zlardan test ishlaysiz.\n"
-        "Bu mashq rejimi hisoblanadi va ball qo'shilmaydi.\n\n"
+        "Bu mashq rejimi hisoblanadi va ball qo'shilmaydi.\n"
+        "Test tugagach, xato ishlangan savollarni qayta ishlash mumkin.\n\n"
         "➕ So'z qo'shish\n"
         "Yangi inglizcha-o'zbekcha so'z juftligini botga qo'shishingiz mumkin.\n"
         "Har bir inglizcha so'z faqat 1 marta, har bir o'zbekcha so'z ham faqat 1 marta kiritiladi.\n\n"
@@ -563,13 +568,16 @@ def get_main_menu_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_after_test_markup():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🔁 Yana test", callback_data="repeat_test")],
-            [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
-        ]
-    )
+def get_after_test_markup(test_mode_type: str | None, has_wrong_answers: bool):
+    buttons = []
+
+    if test_mode_type == "my" and has_wrong_answers:
+        buttons.append([InlineKeyboardButton("❌ Xatolarni qayta ishlash", callback_data="retry_wrong")])
+
+    buttons.append([InlineKeyboardButton("🔁 Yana test", callback_data="repeat_test")])
+    buttons.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
+
+    return InlineKeyboardMarkup(buttons)
 
 
 async def safe_answer_callback(query):
@@ -626,8 +634,35 @@ def clear_test_state(context: ContextTypes.DEFAULT_TYPE):
         "current_question",
         "current_options",
         "test_mode_type",
+        "wrong_answers",
+        "global_partial_saved",
     ]:
         context.user_data.pop(key, None)
+
+
+def save_partial_global_result_if_needed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    test_mode_type = context.user_data.get("test_mode_type")
+    score = context.user_data.get("score", {"total": 0, "correct": 0})
+    already_saved = context.user_data.get("global_partial_saved", False)
+
+    if test_mode_type != "global":
+        return
+
+    if already_saved:
+        return
+
+    total = score.get("total", 0)
+    correct = score.get("correct", 0)
+
+    if total <= 0:
+        return
+
+    user_id, username, full_name = get_user_meta(update)
+    if user_id is None:
+        return
+
+    save_global_result(user_id, username, full_name, total, correct)
+    context.user_data["global_partial_saved"] = True
 
 
 async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update):
@@ -636,11 +671,13 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
     correct = score["correct"]
     percent = round((correct / total) * 100, 1) if total > 0 else 0
     test_mode_type = context.user_data.get("test_mode_type")
+    has_wrong_answers = bool(context.user_data.get("wrong_answers"))
 
     user_id, username, full_name = get_user_meta(update)
 
     if test_mode_type == "global" and user_id is not None:
         save_global_result(user_id, username, full_name, total, correct)
+        context.user_data["global_partial_saved"] = True
         total_global_score = get_user_total_global_score(user_id)
 
         text = (
@@ -650,27 +687,52 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
             f"🏅 Ushbu test uchun ball: {correct}\n"
             f"🔥 Umumiy global ballingiz: {total_global_score}"
         )
-    else:
+    elif test_mode_type in {"my", "my_retry"}:
+        title = "✅ Mening testim tugadi!" if test_mode_type == "my" else "✅ Xato savollar testi tugadi!"
         text = (
-            "✅ Mening testim tugadi!\n\n"
+            f"{title}\n\n"
             f"📊 Natija: {correct}/{total}\n"
             f"📈 Foiz: {percent}%\n\n"
             "Bu mashq rejimi, ball qo'shilmadi."
         )
+    else:
+        text = (
+            "✅ Test tugadi!\n\n"
+            f"📊 Natija: {correct}/{total}\n"
+            f"📈 Foiz: {percent}%"
+        )
 
-    clear_test_state(context)
+    markup = get_after_test_markup(test_mode_type, has_wrong_answers)
 
     await safe_edit_or_send(
         query,
         text,
-        reply_markup=get_after_test_markup(),
+        reply_markup=markup,
     )
+
+    if test_mode_type == "global":
+        clear_test_state(context)
+    else:
+        for key in [
+            "test_words",
+            "score",
+            "correct",
+            "q_type",
+            "test_queue",
+            "current_question",
+            "current_options",
+            "test_mode_type",
+            "global_partial_saved",
+        ]:
+            context.user_data.pop(key, None)
 
 
 # =========================
 # HANDLERS
 # =========================
 async def restart_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_partial_global_result_if_needed(update, context)
+
     clear_test_state(context)
     context.user_data.pop("eng", None)
 
@@ -692,6 +754,8 @@ async def restart_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_partial_global_result_if_needed(update, context)
+
     clear_test_state(context)
     context.user_data.pop("eng", None)
     await update.message.reply_text(
@@ -703,6 +767,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await safe_answer_callback(query)
+
+    save_partial_global_result_if_needed(update, context)
+
     clear_test_state(context)
     context.user_data.pop("eng", None)
     await safe_edit_or_send(query, get_start_text(), reply_markup=get_main_menu_markup())
@@ -793,6 +860,8 @@ async def add_uzbek(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_partial_global_result_if_needed(update, context)
+
     clear_test_state(context)
     context.user_data.pop("eng", None)
 
@@ -855,10 +924,16 @@ async def global_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    context.user_data["test_words"] = words
+    selected_words = words[:]
+    random.shuffle(selected_words)
+    selected_words = selected_words[:GLOBAL_TEST_MAX_WORDS]
+
+    context.user_data["test_words"] = selected_words
     context.user_data["score"] = {"total": 0, "correct": 0}
-    context.user_data["test_queue"] = build_test_queue(words)
+    context.user_data["test_queue"] = build_test_queue(selected_words)
     context.user_data["test_mode_type"] = "global"
+    context.user_data["wrong_answers"] = []
+    context.user_data["global_partial_saved"] = False
 
     await generate_question(update, context, query)
 
@@ -884,6 +959,35 @@ async def my_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["score"] = {"total": 0, "correct": 0}
     context.user_data["test_queue"] = build_test_queue(words)
     context.user_data["test_mode_type"] = "my"
+    context.user_data["wrong_answers"] = []
+    context.user_data["global_partial_saved"] = False
+
+    await generate_question(update, context, query)
+
+
+async def retry_wrong_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    wrongs = context.user_data.get("wrong_answers", [])
+
+    if not wrongs:
+        await safe_edit_or_send(
+            query,
+            "Xato ishlangan savollar topilmadi.",
+            reply_markup=get_main_menu_markup(),
+        )
+        return
+
+    retry_queue = wrongs.copy()
+    random.shuffle(retry_queue)
+
+    context.user_data["test_words"] = [item["correct"] for item in retry_queue]
+    context.user_data["score"] = {"total": 0, "correct": 0}
+    context.user_data["test_queue"] = retry_queue
+    context.user_data["test_mode_type"] = "my_retry"
+    context.user_data["wrong_answers"] = []
+    context.user_data["global_partial_saved"] = False
 
     await generate_question(update, context, query)
 
@@ -914,7 +1018,7 @@ async def generate_question(
     words = context.user_data.get("test_words", [])
     test_queue = context.user_data.get("test_queue", [])
 
-    if len(words) < 4:
+    if len(words) < 4 and context.user_data.get("test_mode_type") not in {"my_retry"}:
         if query:
             await safe_edit_or_send(
                 query,
@@ -923,6 +1027,11 @@ async def generate_question(
                     [[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]
                 ),
             )
+        return
+
+    if context.user_data.get("test_mode_type") == "my_retry" and not test_queue:
+        if query:
+            await finish_test(query, context, update)
         return
 
     if not test_queue:
@@ -962,11 +1071,17 @@ async def generate_question(
     keyboard.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
 
     score = context.user_data["score"]
-    total_questions = len(words) * 2
+    total_questions = score["total"] + len(test_queue) + 1
     used_count = score["total"]
     remaining = total_questions - used_count
 
-    mode_title = "🌍 Global test" if context.user_data.get("test_mode_type") == "global" else "👤 Mening testim"
+    mode_type = context.user_data.get("test_mode_type")
+    if mode_type == "global":
+        mode_title = "🌍 Global test"
+    elif mode_type == "my_retry":
+        mode_title = "❌ Xato savollar testi"
+    else:
+        mode_title = "👤 Mening testim"
 
     score_text = (
         f"{mode_title}\n"
@@ -1046,6 +1161,16 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["score"]["correct"] += 1
         feedback_text = "✅ To'g'ri!"
     else:
+        if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
+            wrong_answers = context.user_data.get("wrong_answers", [])
+            wrong_answers.append(
+                {
+                    "q_type": q_type,
+                    "correct": correct,
+                }
+            )
+            context.user_data["wrong_answers"] = wrong_answers
+
         if q_type == "eng2uz":
             feedback_text = f"❌ Xato!\nTo'g'ri javob: {correct['english']} -> {correct['uzbek']}"
         else:
@@ -1087,6 +1212,7 @@ def main():
     app.add_handler(CallbackQueryHandler(menu, pattern="^menu$"))
     app.add_handler(CallbackQueryHandler(global_test_handler, pattern="^global_test$"))
     app.add_handler(CallbackQueryHandler(my_test_handler, pattern="^my_test$"))
+    app.add_handler(CallbackQueryHandler(retry_wrong_handler, pattern="^retry_wrong$"))
     app.add_handler(CallbackQueryHandler(repeat_test_handler, pattern="^repeat_test$"))
     app.add_handler(CallbackQueryHandler(my_words_handler, pattern=r"^my_words_\d+$"))
     app.add_handler(CallbackQueryHandler(global_words_handler, pattern=r"^global_words_\d+$"))
