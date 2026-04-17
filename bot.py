@@ -404,12 +404,21 @@ def get_random_incorrect(correct_word, all_words, lang="eng"):
 
     return candidates
 
-
 def build_test_queue(words: list[dict]) -> list[dict]:
     queue = []
+
     for word in words:
-        queue.append({"q_type": "eng2uz", "correct": word})
-        queue.append({"q_type": "uz2eng", "correct": word})
+        # 🔥 har bir word uchun RANDOM direction
+        if random.random() < 0.5:
+            q_type = "eng2uz"
+        else:
+            q_type = "uz2eng"
+
+        queue.append({
+            "q_type": q_type,
+            "correct": word
+        })
+
     random.shuffle(queue)
     return queue
 
