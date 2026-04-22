@@ -42,6 +42,7 @@ ENGLISH, UZBEK = range(2)
 WORDS_SHEET_NAME = "words"
 RESULTS_SHEET_NAME = "results"
 PROGRESS_SHEET_NAME = "progress"
+BOOKS_SHEET_NAME = "books"
 
 GLOBAL_WORDS_PAGE_SIZE = 20
 MY_WORDS_PAGE_SIZE = 20
@@ -50,10 +51,13 @@ TOP_LIMIT = 5
 
 WORDS_CACHE = []
 LAST_FETCH = 0
+BOOKS_CACHE = []
+LAST_BOOKS_FETCH = 0
 CACHE_TTL = 300  # 5 minut
 
 GLOBAL_TEST_MAX_QUESTIONS = 25
 MY_TEST_MAX_QUESTIONS = 25
+BOOK_TEST_MAX_QUESTIONS = 25
 
 
 # =========================
@@ -78,7 +82,7 @@ def ensure_worksheet(name: str, headers: list[str]):
     try:
         ws = spreadsheet.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=name, rows=1000, cols=max(20, len(headers)))
+        ws = spreadsheet.add_worksheet(title=name, rows=2000, cols=max(20, len(headers)))
         ws.append_row(headers)
         return ws
 
@@ -102,6 +106,10 @@ words_sheet = ensure_worksheet(
         "added_by_username",
         "added_by_full_name",
         "created_at",
+        "source_type",
+        "book_id",
+        "book_name",
+        "section",
     ],
 )
 
@@ -131,6 +139,18 @@ progress_sheet = ensure_worksheet(
         "wrong_count",
         "last_result",
         "updated_at",
+    ],
+)
+
+books_sheet = ensure_worksheet(
+    BOOKS_SHEET_NAME,
+    [
+        "book_id",
+        "book_name",
+        "has_sections",
+        "total_sections",
+        "total_words",
+        "is_active",
     ],
 )
 
@@ -191,9 +211,11 @@ def get_user_meta(update: Update):
 
 
 def invalidate_cache():
-    global WORDS_CACHE, LAST_FETCH
+    global WORDS_CACHE, LAST_FETCH, BOOKS_CACHE, LAST_BOOKS_FETCH
     WORDS_CACHE = []
     LAST_FETCH = 0
+    BOOKS_CACHE = []
+    LAST_BOOKS_FETCH = 0
 
 
 def get_all_words(force_refresh: bool = False):
@@ -238,6 +260,10 @@ def get_all_words(force_refresh: bool = False):
                     "added_by_username": normalize_text(row.get("added_by_username")),
                     "added_by_full_name": normalize_text(row.get("added_by_full_name")),
                     "created_at": normalize_text(row.get("created_at")),
+                    "source_type": normalize_text(row.get("source_type")),
+                    "book_id": normalize_text(row.get("book_id")),
+                    "book_name": normalize_text(row.get("book_name")),
+                    "section": normalize_text(row.get("section")),
                 }
             )
 
@@ -250,8 +276,100 @@ def get_all_words(force_refresh: bool = False):
         return WORDS_CACHE if WORDS_CACHE else []
 
 
+def get_books(force_refresh: bool = False):
+    global BOOKS_CACHE, LAST_BOOKS_FETCH
+
+    try:
+        now = time.time()
+        if not force_refresh and BOOKS_CACHE and (now - LAST_BOOKS_FETCH < CACHE_TTL):
+            return BOOKS_CACHE
+
+        values = books_sheet.get_all_values()
+        if not values or len(values) < 2:
+            BOOKS_CACHE = []
+            LAST_BOOKS_FETCH = now
+            return BOOKS_CACHE
+
+        headers = [str(h).strip() for h in values[0]]
+        rows = values[1:]
+
+        books = []
+        for raw_row in rows:
+            row = {}
+            for idx, header in enumerate(headers):
+                row[header] = raw_row[idx] if idx < len(raw_row) else ""
+
+            is_active = normalize_text(row.get("is_active")).lower()
+            if is_active not in {"yes", "true", "1"}:
+                continue
+
+            books.append(
+                {
+                    "book_id": normalize_text(row.get("book_id")),
+                    "book_name": normalize_text(row.get("book_name")),
+                    "has_sections": normalize_text(row.get("has_sections")).lower() in {"yes", "true", "1"},
+                    "total_sections": normalize_text(row.get("total_sections")),
+                    "total_words": normalize_text(row.get("total_words")),
+                    "is_active": True,
+                }
+            )
+
+        BOOKS_CACHE = books
+        LAST_BOOKS_FETCH = now
+        return BOOKS_CACHE
+
+    except Exception as e:
+        logger.exception("get_books error: %s", e)
+        return BOOKS_CACHE if BOOKS_CACHE else []
+
+
+def get_book_by_id(book_id: str):
+    for book in get_books():
+        if book["book_id"] == book_id:
+            return book
+    return None
+
+
+def get_book_words(book_id: str):
+    return [w for w in get_all_words() if w.get("book_id") == book_id]
+
+
+def get_book_sections(book_id: str):
+    words = get_book_words(book_id)
+    sections = []
+    seen = set()
+
+    for w in words:
+        section = normalize_text(w.get("section"))
+        if not section:
+            continue
+        if section not in seen:
+            seen.add(section)
+            sections.append(section)
+
+    def section_sort_key(s: str):
+        try:
+            lower = s.lower().replace("unit", "").strip()
+            return int(lower)
+        except Exception:
+            return 999999
+
+    sections.sort(key=section_sort_key)
+    return sections
+
+
+def get_section_words(book_id: str, section: str):
+    return [
+        w for w in get_book_words(book_id)
+        if normalize_text(w.get("section")) == normalize_text(section)
+    ]
+
+
 def get_user_words(user_id: int):
-    return [w for w in get_all_words() if w.get("added_by_user_id") == user_id]
+    return [
+        w for w in get_all_words()
+        if w.get("added_by_user_id") == user_id and normalize_text(w.get("source_type")) != "book"
+    ]
 
 
 def add_word(eng: str, uzb: str, user_id: int, username: str | None, full_name: str | None):
@@ -267,6 +385,9 @@ def add_word(eng: str, uzb: str, user_id: int, username: str | None, full_name: 
         uzb_lower = uzb.lower()
 
         for row in words:
+            if normalize_text(row.get("source_type")) == "book":
+                continue
+
             existing_eng = normalize_text(row["english"]).lower()
             existing_uzb = normalize_text(row["uzbek"]).lower()
 
@@ -281,6 +402,10 @@ def add_word(eng: str, uzb: str, user_id: int, username: str | None, full_name: 
                 username,
                 full_name,
                 now_str(),
+                "user",
+                "",
+                "",
+                "",
             ]
         )
 
@@ -680,22 +805,76 @@ def format_leaderboard_page(users: list[dict], page: int, page_size: int):
     return text, page
 
 
+def build_books_grid_markup(books: list[dict]):
+    buttons = []
+    row = []
+
+    for book in books:
+        row.append(
+            InlineKeyboardButton(
+                book["book_name"],
+                callback_data=f"book_open::{book['book_id']}",
+            )
+        )
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+
+    if row:
+        buttons.append(row)
+
+    buttons.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_sections_grid_markup(book_id: str, sections: list[str]):
+    buttons = []
+    row = []
+
+    for section in sections:
+        safe_section = section.replace(" ", "_")
+        row.append(
+            InlineKeyboardButton(
+                section,
+                callback_data=f"book_section_open::{book_id}::{safe_section}",
+            )
+        )
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+
+    if row:
+        buttons.append(row)
+
+    buttons.append([InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_open::{book_id}")])
+    buttons.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
 def build_rules_text():
     return (
         "ℹ️ Bot qoidalari va ishlash tartibi\n\n"
         "Ushbu bot inglizcha-o'zbekcha so'zlarni o'rganish va test ishlash uchun yaratilgan.\n\n"
         "🌍 Global test\n"
-        "Bu bo'limda barcha foydalanuvchilar qo'shgan so'zlardan test ishlanadi.\n"
-        "Har bir so'zdan faqat 1 ta savol tushadi. Ya'ni bir so'z uchun inglizcha yoki o'zbekcha tomoni random tanlanadi.\n"
+        "Bu bo'limda barcha foydalanuvchilar qo'shgan oddiy so'zlardan test ishlanadi.\n"
+        "Har bir so'zdan faqat 1 ta savol tushadi. Savol yo'nalishi random bo'ladi.\n"
         f"Global test maksimal {GLOBAL_TEST_MAX_QUESTIONS} ta savol bilan cheklanadi.\n"
         "Agar testni oxirigacha ishlamasdan Menyu tugmasi bilan chiqib ketsangiz ham, ishlangan qism natijasi saqlanadi.\n"
         "Faqat Global test uchun ball beriladi va Leaderboard shu bo'lim asosida shakllanadi.\n\n"
         "👤 Mening testim\n"
-        "Bu bo'limda faqat siz qo'shgan so'zlardan test ishlaysiz.\n"
+        "Bu bo'limda faqat siz qo'shgan oddiy so'zlardan test ishlaysiz.\n"
         "Har bir so'zdan faqat 1 ta savol tushadi.\n"
         "Bu mashq rejimi hisoblanadi va ball qo'shilmaydi.\n"
         "Bot smart repetition mantiqidan foydalanadi: siz ko'proq xato qilgan so'zlar keyingi testlarda ko'proq tushadi.\n"
         "Test tugagach, xato ishlangan savollarni alohida qayta ishlash mumkin.\n\n"
+        "📘 Kitoblar bo'yicha testlar\n"
+        "Bu bo'limda kitoblar ro'yxati 2 ustunli inline tugmalarda ko'rsatiladi.\n"
+        "Kitob ichiga kirganda:\n"
+        "1. Kitob bo'yicha testni boshlash\n"
+        "2. Agar mavjud bo'lsa, bo'limlar bo'yicha test\n"
+        f"Kitob bo'yicha test maksimal {BOOK_TEST_MAX_QUESTIONS} ta savol bo'ladi.\n"
+        "Bo'lim bo'yicha test esa aynan o'sha bo'limdagi so'zlar sonicha bo'ladi.\n"
+        "Har bir so'zdan faqat 1 ta savol tushadi.\n\n"
         "❌ Xatolarni qayta ishlash\n"
         "Mening testim tugagandan keyin xato javob bergan savollar uchun alohida knopka chiqadi.\n"
         "Bu bo'limda faqat xato ishlangan savollar qayta beriladi.\n\n"
@@ -703,9 +882,9 @@ def build_rules_text():
         "Yangi inglizcha-o'zbekcha so'z juftligini botga qo'shishingiz mumkin.\n"
         "Har bir inglizcha so'z faqat 1 marta, har bir o'zbekcha so'z ham faqat 1 marta kiritiladi.\n\n"
         "📚 Mening so'zlarim\n"
-        "Bu yerda siz qo'shgan so'zlarni ko'rasiz.\n\n"
+        "Bu yerda siz qo'shgan oddiy so'zlarni ko'rasiz.\n\n"
         "🌐 Global so'zlar\n"
-        "Bu bo'limda barcha foydalanuvchilar qo'shgan so'zlar sahifalarga bo'lingan holda ko'rsatiladi.\n\n"
+        "Bu bo'limda foydalanuvchilar qo'shgan oddiy so'zlar sahifalarga bo'lingan holda ko'rsatiladi.\n\n"
         "🏆 Leaderboard\n"
         "Bu bo'limda Global test bo'yicha barcha foydalanuvchilar ballari saralangan holda ko'rsatiladi.\n\n"
         "Test tartibi:\n"
@@ -725,6 +904,7 @@ def get_start_text():
         "Bu yerda siz:\n"
         "📚 yangi so'zlar qo'shasiz\n"
         "🧠 test ishlaysiz\n"
+        "📘 kitoblar bo'yicha test ishlaysiz\n"
         "🏆 va TOP foydalanuvchilar qatoriga qo'shilasiz\n\n"
         "🏆 Our Top 5 Vocab Pros:\n\n"
     )
@@ -752,6 +932,7 @@ def get_main_menu_markup() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📚 Mening so'zlarim", callback_data="my_words_0")],
         [InlineKeyboardButton("🌐 Global so'zlar", callback_data="global_words_0")],
         [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard_0")],
+        [InlineKeyboardButton("📘 Kitoblar bo'yicha testlar", callback_data="books_menu")],
         [InlineKeyboardButton("ℹ️ Qoidalar", callback_data="rules")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -825,6 +1006,8 @@ def clear_test_state(context: ContextTypes.DEFAULT_TYPE):
         "test_mode_type",
         "wrong_answers",
         "global_partial_saved",
+        "current_book_id",
+        "current_book_section",
     ]:
         context.user_data.pop(key, None)
 
@@ -890,6 +1073,29 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
             f"📈 Foiz: {percent}%\n\n"
             "Bu mashq rejimi, ball qo'shilmadi."
         )
+    elif test_mode_type == "book":
+        book_id = context.user_data.get("current_book_id")
+        book = get_book_by_id(book_id) if book_id else None
+        book_name = book["book_name"] if book else "Kitob testi"
+
+        text = (
+            f"✅ {book_name} testi tugadi!\n\n"
+            f"📊 Natija: {correct}/{total}\n"
+            f"📈 Foiz: {percent}%\n\n"
+            "Bu kitob bo'yicha mashq rejimi."
+        )
+    elif test_mode_type == "book_section":
+        book_id = context.user_data.get("current_book_id")
+        section = context.user_data.get("current_book_section", "")
+        book = get_book_by_id(book_id) if book_id else None
+        book_name = book["book_name"] if book else "Kitob"
+
+        text = (
+            f"✅ {book_name} — {section} testi tugadi!\n\n"
+            f"📊 Natija: {correct}/{total}\n"
+            f"📈 Foiz: {percent}%\n\n"
+            "Bu bo'lim bo'yicha mashq rejimi."
+        )
     else:
         text = (
             "✅ Test tugadi!\n\n"
@@ -918,6 +1124,8 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
             "current_options",
             "test_mode_type",
             "global_partial_saved",
+            "current_book_id",
+            "current_book_section",
         ]:
             context.user_data.pop(key, None)
 
@@ -997,6 +1205,138 @@ async def rules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]
         ),
     )
+
+
+async def books_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    books = get_books()
+
+    if not books:
+        await safe_edit_or_send(
+            query,
+            "Hozircha kitoblar qo'shilmagan.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]
+            ),
+        )
+        return
+
+    await safe_edit_or_send(
+        query,
+        "📘 Kitoblar bo'yicha testlar\n\nKerakli kitobni tanlang:",
+        reply_markup=build_books_grid_markup(books),
+    )
+
+
+async def book_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    data = query.data
+    book_id = data.split("::", 1)[1]
+    book = get_book_by_id(book_id)
+
+    if not book:
+        await safe_edit_or_send(
+            query,
+            "Kitob topilmadi.",
+            reply_markup=get_main_menu_markup(),
+        )
+        return
+
+    buttons = [
+        [InlineKeyboardButton("▶️ Kitob bo'yicha testni boshlash", callback_data=f"book_test::{book_id}")]
+    ]
+
+    if book["has_sections"]:
+        buttons.append([InlineKeyboardButton("📂 Bo'limlar bo'yicha test", callback_data=f"book_sections::{book_id}")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="books_menu")])
+    buttons.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
+
+    total_words = len(get_book_words(book_id))
+    text = (
+        f"📘 {book['book_name']}\n\n"
+        f"📚 Jami so'zlar: {total_words}\n"
+        f"📂 Bo'limlar: {book.get('total_sections') or '-'}\n\n"
+        "Kerakli amalni tanlang:"
+    )
+
+    await safe_edit_or_send(
+        query,
+        text,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def book_sections_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    data = query.data
+    book_id = data.split("::", 1)[1]
+    book = get_book_by_id(book_id)
+
+    if not book:
+        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
+        return
+
+    sections = get_book_sections(book_id)
+    if not sections:
+        await safe_edit_or_send(
+            query,
+            "Bu kitob uchun bo'limlar topilmadi.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_open::{book_id}")],
+                    [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
+                ]
+            ),
+        )
+        return
+
+    await safe_edit_or_send(
+        query,
+        f"📂 {book['book_name']} bo'limlari\n\nKerakli bo'limni tanlang:",
+        reply_markup=build_sections_grid_markup(book_id, sections),
+    )
+
+
+async def book_section_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    parts = query.data.split("::")
+    if len(parts) != 3:
+        await safe_edit_or_send(query, "Bo'lim ma'lumoti xato.", reply_markup=get_main_menu_markup())
+        return
+
+    book_id = parts[1]
+    section = parts[2].replace("_", " ")
+
+    book = get_book_by_id(book_id)
+    if not book:
+        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
+        return
+
+    words = get_section_words(book_id, section)
+    count = len(words)
+
+    buttons = [
+        [InlineKeyboardButton("▶️ Bo'lim bo'yicha testni boshlash", callback_data=f"book_section_test::{book_id}::{parts[2]}")],
+        [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_sections::{book_id}")],
+        [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
+    ]
+
+    text = (
+        f"📂 {book['book_name']} — {section}\n\n"
+        f"📚 Shu bo'limdagi so'zlar: {count}\n\n"
+        "Testni boshlash uchun tugmani bosing."
+    )
+
+    await safe_edit_or_send(query, text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1097,7 +1437,7 @@ async def global_words_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         page = 0
 
-    words = get_all_words()
+    words = [w for w in get_all_words() if normalize_text(w.get("source_type")) != "book"]
     text, page = format_words_page("🌐 Global so'zlar", words, page, GLOBAL_WORDS_PAGE_SIZE, show_owner=False)
     markup = build_pagination_markup("global_words", page, len(words), GLOBAL_WORDS_PAGE_SIZE)
     await safe_edit_or_send(query, text, reply_markup=markup)
@@ -1107,7 +1447,7 @@ async def global_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await safe_answer_callback(query)
 
-    words = get_all_words()
+    words = [w for w in get_all_words() if normalize_text(w.get("source_type")) != "book"]
 
     if len(words) < 4:
         await safe_edit_or_send(
@@ -1204,10 +1544,94 @@ async def repeat_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             [
                 [InlineKeyboardButton("🌍 Global test", callback_data="global_test")],
                 [InlineKeyboardButton("👤 Mening testim", callback_data="my_test")],
+                [InlineKeyboardButton("📘 Kitoblar bo'yicha testlar", callback_data="books_menu")],
                 [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
             ]
         ),
     )
+
+
+async def book_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    book_id = query.data.split("::", 1)[1]
+    book = get_book_by_id(book_id)
+    if not book:
+        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
+        return
+
+    words = get_book_words(book_id)
+    if len(words) < 4:
+        await safe_edit_or_send(
+            query,
+            "Bu kitob bo'yicha test uchun yetarli so'z topilmadi.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_open::{book_id}")],
+                    [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
+                ]
+            ),
+        )
+        return
+
+    selected_words = words[:]
+    random.shuffle(selected_words)
+    selected_words = selected_words[:min(BOOK_TEST_MAX_QUESTIONS, len(selected_words))]
+
+    context.user_data["test_words"] = selected_words
+    context.user_data["score"] = {"total": 0, "correct": 0}
+    context.user_data["test_queue"] = build_test_queue(selected_words)
+    context.user_data["test_mode_type"] = "book"
+    context.user_data["wrong_answers"] = []
+    context.user_data["global_partial_saved"] = False
+    context.user_data["current_book_id"] = book_id
+    context.user_data["current_book_section"] = ""
+
+    await generate_question(update, context, query)
+
+
+async def book_section_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    parts = query.data.split("::")
+    if len(parts) != 3:
+        await safe_edit_or_send(query, "Bo'lim ma'lumoti xato.", reply_markup=get_main_menu_markup())
+        return
+
+    book_id = parts[1]
+    section = parts[2].replace("_", " ")
+
+    book = get_book_by_id(book_id)
+    if not book:
+        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
+        return
+
+    words = get_section_words(book_id, section)
+    if len(words) < 2:
+        await safe_edit_or_send(
+            query,
+            "Bu bo'lim bo'yicha test uchun yetarli so'z topilmadi.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_sections::{book_id}")],
+                    [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
+                ]
+            ),
+        )
+        return
+
+    context.user_data["test_words"] = words
+    context.user_data["score"] = {"total": 0, "correct": 0}
+    context.user_data["test_queue"] = build_test_queue(words)
+    context.user_data["test_mode_type"] = "book_section"
+    context.user_data["wrong_answers"] = []
+    context.user_data["global_partial_saved"] = False
+    context.user_data["current_book_id"] = book_id
+    context.user_data["current_book_section"] = section
+
+    await generate_question(update, context, query)
 
 
 async def generate_question(
@@ -1219,7 +1643,15 @@ async def generate_question(
     words = context.user_data.get("test_words", [])
     test_queue = context.user_data.get("test_queue", [])
 
-    if len(words) < 4 and context.user_data.get("test_mode_type") not in {"my_retry"}:
+    mode_type = context.user_data.get("test_mode_type")
+
+    min_required = 4
+    if mode_type == "book_section":
+        min_required = 2
+    if mode_type == "my_retry":
+        min_required = 1
+
+    if len(words) < min_required and mode_type not in {"my_retry"}:
         if query:
             await safe_edit_or_send(
                 query,
@@ -1271,11 +1703,20 @@ async def generate_question(
     used_count = score["total"]
     remaining = total_questions - used_count
 
-    mode_type = context.user_data.get("test_mode_type")
     if mode_type == "global":
         mode_title = "🌍 Global test"
     elif mode_type == "my_retry":
         mode_title = "❌ Xato savollar testi"
+    elif mode_type == "book":
+        book = get_book_by_id(context.user_data.get("current_book_id", ""))
+        mode_title = f"📘 {book['book_name']}" if book else "📘 Kitob testi"
+    elif mode_type == "book_section":
+        book = get_book_by_id(context.user_data.get("current_book_id", ""))
+        section = context.user_data.get("current_book_section", "")
+        if book:
+            mode_title = f"📂 {book['book_name']} — {section}"
+        else:
+            mode_title = f"📂 {section}"
     else:
         mode_title = "👤 Mening testim"
 
@@ -1424,6 +1865,12 @@ def main():
     app.add_handler(CallbackQueryHandler(my_words_handler, pattern=r"^my_words_\d+$"))
     app.add_handler(CallbackQueryHandler(global_words_handler, pattern=r"^global_words_\d+$"))
     app.add_handler(CallbackQueryHandler(leaderboard_handler, pattern=r"^leaderboard_\d+$"))
+    app.add_handler(CallbackQueryHandler(books_menu_handler, pattern="^books_menu$"))
+    app.add_handler(CallbackQueryHandler(book_open_handler, pattern=r"^book_open::"))
+    app.add_handler(CallbackQueryHandler(book_sections_handler, pattern=r"^book_sections::"))
+    app.add_handler(CallbackQueryHandler(book_section_open_handler, pattern=r"^book_section_open::"))
+    app.add_handler(CallbackQueryHandler(book_test_handler, pattern=r"^book_test::"))
+    app.add_handler(CallbackQueryHandler(book_section_test_handler, pattern=r"^book_section_test::"))
     app.add_handler(CallbackQueryHandler(rules_handler, pattern="^rules$"))
     app.add_handler(CallbackQueryHandler(check_answer, pattern=r"^(eng_|uz_)\d+$"))
 
