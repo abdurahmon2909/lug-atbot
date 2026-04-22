@@ -1,25 +1,32 @@
-import logging
-import random
+import asyncio
 import json
+import logging
 import os
+import random
 import time
 from datetime import datetime
 from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import Conflict, BadRequest
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-    ConversationHandler,
-    ContextTypes,
-)
-
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import (
+    BadRequest,
+    Conflict,
+    Forbidden,
+    NetworkError,
+    RetryAfter,
+    TimedOut,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 # =========================
 # SOZLAMA
@@ -27,9 +34,10 @@ from oauth2client.service_account import ServiceAccountCredentials
 TOKEN = os.environ.get("BOT_TOKEN")
 SHEET_ID = os.environ.get("SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 if not TOKEN or not SHEET_ID or not GOOGLE_CREDENTIALS_JSON:
-    raise ValueError("Environment variables not set!")
+    raise ValueError("BOT_TOKEN, SHEET_ID, GOOGLE_CREDENTIALS bo'lishi shart!")
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -37,20 +45,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# =========================
+# STATE'LAR
+# =========================
 ENGLISH, UZBEK = range(2)
+ADMIN_MENU, BROADCAST_TEXT, BROADCAST_PHOTO = range(100, 103)
 
+# =========================
+# SHEET NOMLARI
+# =========================
 WORDS_SHEET_NAME = "words"
 RESULTS_SHEET_NAME = "results"
 PROGRESS_SHEET_NAME = "progress"
 BOOKS_SHEET_NAME = "books"
+USERS_SHEET_NAME = "users"
 
+# =========================
+# PAGINATION / LIMIT
+# =========================
 GLOBAL_WORDS_PAGE_SIZE = 20
 MY_WORDS_PAGE_SIZE = 20
 LEADERBOARD_PAGE_SIZE = 20
 TOP_LIMIT = 5
 
+GLOBAL_TEST_MAX_QUESTIONS = 25
+MY_TEST_MAX_QUESTIONS = 25
+BOOK_TEST_MAX_QUESTIONS = 25
+
+# =========================
+# CACHE
+# =========================
 WORDS_CACHE = []
-LAST_FETCH = 0
+LAST_WORDS_FETCH = 0
 
 BOOKS_CACHE = []
 LAST_BOOKS_FETCH = 0
@@ -58,16 +84,17 @@ LAST_BOOKS_FETCH = 0
 RESULTS_CACHE = []
 LAST_RESULTS_FETCH = 0
 
-PROGRESS_CACHE = {}
+USERS_CACHE = []
+LAST_USERS_FETCH = 0
+
+PROGRESS_CACHE_BY_USER = {}
 PROGRESS_CACHE_TS = {}
 
-CACHE_TTL = 300
+WORDS_CACHE_TTL = 300
+BOOKS_CACHE_TTL = 300
 RESULTS_CACHE_TTL = 60
+USERS_CACHE_TTL = 60
 PROGRESS_CACHE_TTL = 120
-
-GLOBAL_TEST_MAX_QUESTIONS = 25
-MY_TEST_MAX_QUESTIONS = 25
-BOOK_TEST_MAX_QUESTIONS = 25
 
 
 # =========================
@@ -84,7 +111,7 @@ try:
     spreadsheet = client.open_by_key(SHEET_ID)
     print("✅ Google Sheetsga ulandi!")
 except Exception as e:
-    print(f"❌ Google Sheets error: {e}")
+    print(f"❌ Google Sheets xatoligi: {e}")
     raise
 
 
@@ -92,18 +119,20 @@ def ensure_worksheet(name: str, headers: list[str]):
     try:
         ws = spreadsheet.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=name, rows=4000, cols=max(20, len(headers)))
+        ws = spreadsheet.add_worksheet(title=name, rows=5000, cols=max(20, len(headers)))
         ws.append_row(headers)
         return ws
 
     current_headers = ws.row_values(1)
+    if not current_headers:
+        ws.append_row(headers)
+        return ws
+
     if current_headers != headers:
-        if not current_headers:
-            ws.append_row(headers)
-        else:
-            for idx, header in enumerate(headers, start=1):
-                if idx > len(current_headers) or current_headers[idx - 1] != header:
-                    ws.update_cell(1, idx, header)
+        for idx, header in enumerate(headers, start=1):
+            if idx > len(current_headers) or current_headers[idx - 1] != header:
+                ws.update_cell(1, idx, header)
+
     return ws
 
 
@@ -164,6 +193,19 @@ books_sheet = ensure_worksheet(
     ],
 )
 
+users_sheet = ensure_worksheet(
+    USERS_SHEET_NAME,
+    [
+        "user_id",
+        "username",
+        "full_name",
+        "first_seen",
+        "last_seen",
+        "is_blocked",
+        "updated_at",
+    ],
+)
+
 
 # =========================
 # YORDAMCHI FUNKSIYALAR
@@ -209,8 +251,8 @@ def get_user_meta(update: Update):
 
     user_id = user.id
     username = normalize_text(getattr(user, "username", ""))
-
     full_name = normalize_text(getattr(user, "full_name", ""))
+
     if not full_name:
         full_name = build_full_name(
             getattr(user, "first_name", ""),
@@ -220,10 +262,20 @@ def get_user_meta(update: Update):
     return user_id, username, full_name
 
 
+def safe_int(value, default=0):
+    try:
+        return int(float(str(value or 0)))
+    except Exception:
+        return default
+
+
+# =========================
+# CACHE INVALIDATION
+# =========================
 def invalidate_words_cache():
-    global WORDS_CACHE, LAST_FETCH
+    global WORDS_CACHE, LAST_WORDS_FETCH
     WORDS_CACHE = []
-    LAST_FETCH = 0
+    LAST_WORDS_FETCH = 0
 
 
 def invalidate_books_cache():
@@ -238,39 +290,47 @@ def invalidate_results_cache():
     LAST_RESULTS_FETCH = 0
 
 
+def invalidate_users_cache():
+    global USERS_CACHE, LAST_USERS_FETCH
+    USERS_CACHE = []
+    LAST_USERS_FETCH = 0
+
+
 def invalidate_progress_cache_for_user(user_id: int):
-    if user_id in PROGRESS_CACHE:
-        PROGRESS_CACHE.pop(user_id, None)
-    if user_id in PROGRESS_CACHE_TS:
-        PROGRESS_CACHE_TS.pop(user_id, None)
+    PROGRESS_CACHE_BY_USER.pop(user_id, None)
+    PROGRESS_CACHE_TS.pop(user_id, None)
 
 
 def invalidate_all_cache():
     invalidate_words_cache()
     invalidate_books_cache()
     invalidate_results_cache()
-    PROGRESS_CACHE.clear()
+    invalidate_users_cache()
+    PROGRESS_CACHE_BY_USER.clear()
     PROGRESS_CACHE_TS.clear()
 
 
+# =========================
+# SHEET O'QISH
+# =========================
 def get_all_words(force_refresh: bool = False):
-    global WORDS_CACHE, LAST_FETCH
+    global WORDS_CACHE, LAST_WORDS_FETCH
 
     try:
         now = time.time()
-        if not force_refresh and WORDS_CACHE and (now - LAST_FETCH < CACHE_TTL):
+        if not force_refresh and WORDS_CACHE and now - LAST_WORDS_FETCH < WORDS_CACHE_TTL:
             return WORDS_CACHE
 
         values = words_sheet.get_all_values()
         if not values or len(values) < 2:
             WORDS_CACHE = []
-            LAST_FETCH = now
+            LAST_WORDS_FETCH = now
             return WORDS_CACHE
 
         headers = [str(h).strip() for h in values[0]]
         rows = values[1:]
+        parsed = []
 
-        words = []
         for raw_row in rows:
             row = {}
             for idx, header in enumerate(headers):
@@ -287,7 +347,7 @@ def get_all_words(force_refresh: bool = False):
             except Exception:
                 added_by_user_id = None
 
-            words.append(
+            parsed.append(
                 {
                     "english": eng,
                     "uzbek": uzb,
@@ -302,8 +362,8 @@ def get_all_words(force_refresh: bool = False):
                 }
             )
 
-        WORDS_CACHE = words
-        LAST_FETCH = now
+        WORDS_CACHE = parsed
+        LAST_WORDS_FETCH = now
         return WORDS_CACHE
 
     except Exception as e:
@@ -316,25 +376,14 @@ def get_books(force_refresh: bool = False):
 
     try:
         now = time.time()
-        if not force_refresh and BOOKS_CACHE and (now - LAST_BOOKS_FETCH < CACHE_TTL):
+        if not force_refresh and BOOKS_CACHE and now - LAST_BOOKS_FETCH < BOOKS_CACHE_TTL:
             return BOOKS_CACHE
 
-        values = books_sheet.get_all_values()
-        if not values or len(values) < 2:
-            BOOKS_CACHE = []
-            LAST_BOOKS_FETCH = now
-            return BOOKS_CACHE
-
-        headers = [str(h).strip() for h in values[0]]
-        rows = values[1:]
-
+        rows = books_sheet.get_all_records()
         books = []
-        for raw_row in rows:
-            row = {}
-            for idx, header in enumerate(headers):
-                row[header] = raw_row[idx] if idx < len(raw_row) else ""
 
-            is_active = normalize_text(row.get("is_active")).lower()
+        for row in rows:
+            is_active = normalize_text(str(row.get("is_active", ""))).lower()
             if is_active not in {"yes", "true", "1"}:
                 continue
 
@@ -342,9 +391,9 @@ def get_books(force_refresh: bool = False):
                 {
                     "book_id": normalize_text(row.get("book_id")),
                     "book_name": normalize_text(row.get("book_name")),
-                    "has_sections": normalize_text(row.get("has_sections")).lower() in {"yes", "true", "1"},
-                    "total_sections": normalize_text(row.get("total_sections")),
-                    "total_words": normalize_text(row.get("total_words")),
+                    "has_sections": normalize_text(str(row.get("has_sections", ""))).lower() in {"yes", "true", "1"},
+                    "total_sections": normalize_text(str(row.get("total_sections", ""))),
+                    "total_words": normalize_text(str(row.get("total_words", ""))),
                     "is_active": True,
                 }
             )
@@ -363,7 +412,7 @@ def get_results_records(force_refresh: bool = False):
 
     try:
         now = time.time()
-        if not force_refresh and RESULTS_CACHE and (now - LAST_RESULTS_FETCH < RESULTS_CACHE_TTL):
+        if not force_refresh and RESULTS_CACHE and now - LAST_RESULTS_FETCH < RESULTS_CACHE_TTL:
             return RESULTS_CACHE
 
         RESULTS_CACHE = results_sheet.get_all_records()
@@ -374,22 +423,38 @@ def get_results_records(force_refresh: bool = False):
         return RESULTS_CACHE if RESULTS_CACHE else []
 
 
+def get_users_records(force_refresh: bool = False):
+    global USERS_CACHE, LAST_USERS_FETCH
+
+    try:
+        now = time.time()
+        if not force_refresh and USERS_CACHE and now - LAST_USERS_FETCH < USERS_CACHE_TTL:
+            return USERS_CACHE
+
+        USERS_CACHE = users_sheet.get_all_records()
+        LAST_USERS_FETCH = now
+        return USERS_CACHE
+    except Exception as e:
+        logger.exception("get_users_records error: %s", e)
+        return USERS_CACHE if USERS_CACHE else []
+
+
 def get_user_progress_map(user_id: int, force_refresh: bool = False) -> dict:
     now = time.time()
 
     if (
         not force_refresh
-        and user_id in PROGRESS_CACHE
+        and user_id in PROGRESS_CACHE_BY_USER
         and user_id in PROGRESS_CACHE_TS
-        and (now - PROGRESS_CACHE_TS[user_id] < PROGRESS_CACHE_TTL)
+        and now - PROGRESS_CACHE_TS[user_id] < PROGRESS_CACHE_TTL
     ):
-        return PROGRESS_CACHE[user_id]
+        return PROGRESS_CACHE_BY_USER[user_id]
 
     try:
-        records = progress_sheet.get_all_records()
+        rows = progress_sheet.get_all_records()
         progress_map = {}
 
-        for row in records:
+        for row in rows:
             row_user_id = normalize_text(str(row.get("user_id", "")))
             if row_user_id != str(user_id):
                 continue
@@ -401,29 +466,213 @@ def get_user_progress_map(user_id: int, force_refresh: bool = False) -> dict:
 
             key = f"{english.lower()}::{uzbek.lower()}"
             progress_map[key] = {
-                "seen_count": int(float(str(row.get("seen_count", 0)) or 0)),
-                "correct_count": int(float(str(row.get("correct_count", 0)) or 0)),
-                "wrong_count": int(float(str(row.get("wrong_count", 0)) or 0)),
+                "seen_count": safe_int(row.get("seen_count", 0)),
+                "correct_count": safe_int(row.get("correct_count", 0)),
+                "wrong_count": safe_int(row.get("wrong_count", 0)),
                 "last_result": normalize_text(row.get("last_result")),
             }
 
-        PROGRESS_CACHE[user_id] = progress_map
+        PROGRESS_CACHE_BY_USER[user_id] = progress_map
         PROGRESS_CACHE_TS[user_id] = now
         return progress_map
+
     except Exception as e:
         logger.exception("get_user_progress_map error: %s", e)
-        return PROGRESS_CACHE.get(user_id, {})
+        return PROGRESS_CACHE_BY_USER.get(user_id, {})
 
 
+# =========================
+# USERS / ADMIN
+# =========================
+def save_or_update_user(update: Update):
+    user_id, username, full_name = get_user_meta(update)
+    if user_id is None:
+        return
+
+    try:
+        records = get_users_records(force_refresh=True)
+
+        for idx, row in enumerate(records, start=2):
+            row_user_id = normalize_text(str(row.get("user_id", "")))
+            if row_user_id == str(user_id):
+                first_seen = normalize_text(row.get("first_seen")) or now_str()
+                is_blocked = normalize_text(row.get("is_blocked")) or "no"
+
+                users_sheet.update(
+                    f"B{idx}:G{idx}",
+                    [[
+                        username,
+                        full_name,
+                        first_seen,
+                        now_str(),
+                        is_blocked,
+                        now_str(),
+                    ]]
+                )
+                invalidate_users_cache()
+                return
+
+        users_sheet.append_row(
+            [
+                str(user_id),
+                username,
+                full_name,
+                now_str(),
+                now_str(),
+                "no",
+                now_str(),
+            ]
+        )
+        invalidate_users_cache()
+
+    except Exception as e:
+        logger.exception("save_or_update_user error: %s", e)
+
+
+def mark_user_blocked(user_id: int):
+    try:
+        records = get_users_records(force_refresh=True)
+        for idx, row in enumerate(records, start=2):
+            row_user_id = normalize_text(str(row.get("user_id", "")))
+            if row_user_id == str(user_id):
+                users_sheet.update(f"F{idx}:G{idx}", [["yes", now_str()]])
+                invalidate_users_cache()
+                return
+    except Exception as e:
+        logger.exception("mark_user_blocked error: %s", e)
+
+
+def is_admin(update: Update) -> bool:
+    user = update.effective_user
+    return bool(user and user.id == ADMIN_ID)
+
+
+def build_admin_menu_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📊 Statistika", callback_data="admin_stats")],
+            [InlineKeyboardButton("📨 Text broadcast", callback_data="admin_broadcast_text")],
+            [InlineKeyboardButton("🖼 Rasmli broadcast", callback_data="admin_broadcast_photo")],
+            [InlineKeyboardButton("🧹 Cache refresh", callback_data="admin_cache_refresh")],
+            [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
+        ]
+    )
+
+
+def get_admin_stats_text():
+    users = get_users_records()
+    books = get_books()
+
+    total_users = len(users)
+    blocked_users = 0
+    active_users = 0
+
+    for row in users:
+        is_blocked = normalize_text(str(row.get("is_blocked", ""))).lower()
+        if is_blocked in {"yes", "true", "1"}:
+            blocked_users += 1
+
+        if normalize_text(row.get("last_seen")):
+            active_users += 1
+
+    text = (
+        "📊 Admin statistika\n\n"
+        f"👥 Jami foydalanuvchilar: {total_users}\n"
+        f"✅ Aktiv ko‘ringanlar: {active_users}\n"
+        f"🚫 Block qilganlar: {blocked_users}\n"
+        f"📘 Aktiv kitoblar: {len(books)}"
+    )
+    return text
+
+
+async def broadcast_to_all_users(
+    *,
+    bot,
+    text: str | None = None,
+    photo_file_id: str | None = None,
+    caption: str | None = None,
+):
+    users = get_users_records(force_refresh=True)
+
+    unique_user_ids = []
+    seen = set()
+
+    for row in users:
+        uid_raw = normalize_text(str(row.get("user_id", "")))
+        if not uid_raw.isdigit():
+            continue
+        uid = int(uid_raw)
+        if uid not in seen:
+            seen.add(uid)
+            unique_user_ids.append(uid)
+
+    success = 0
+    failed = 0
+    blocked = 0
+
+    for user_id in unique_user_ids:
+        try:
+            if photo_file_id:
+                await bot.send_photo(
+                    chat_id=user_id,
+                    photo=photo_file_id,
+                    caption=caption or "",
+                )
+            else:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=text or "",
+                )
+
+            success += 1
+            await asyncio.sleep(0.05)
+
+        except RetryAfter as e:
+            wait_time = float(getattr(e, "retry_after", 1)) + 1
+            await asyncio.sleep(wait_time)
+            try:
+                if photo_file_id:
+                    await bot.send_photo(chat_id=user_id, photo=photo_file_id, caption=caption or "")
+                else:
+                    await bot.send_message(chat_id=user_id, text=text or "")
+                success += 1
+            except Exception:
+                failed += 1
+
+        except Forbidden:
+            blocked += 1
+            failed += 1
+            mark_user_blocked(user_id)
+
+        except (TimedOut, NetworkError, BadRequest):
+            failed += 1
+
+        except Exception:
+            failed += 1
+
+    return {
+        "total": len(unique_user_ids),
+        "success": success,
+        "failed": failed,
+        "blocked": blocked,
+    }
+
+
+# =========================
+# BOOKS / WORDS FILTER
+# =========================
 def get_book_by_id(book_id: str):
     for book in get_books():
-        if book["book_id"] == book_id:
+        if normalize_text(book["book_id"]) == normalize_text(book_id):
             return book
     return None
 
 
 def get_book_words(book_id: str):
-    return [w for w in get_all_words() if w.get("book_id") == book_id]
+    return [
+        w for w in get_all_words()
+        if normalize_text(w.get("book_id")) == normalize_text(book_id)
+    ]
 
 
 def get_book_sections(book_id: str):
@@ -441,8 +690,7 @@ def get_book_sections(book_id: str):
 
     def section_sort_key(s: str):
         try:
-            lower = s.lower().replace("unit", "").strip()
-            return int(lower)
+            return int(s.lower().replace("unit", "").strip())
         except Exception:
             return 999999
 
@@ -464,6 +712,9 @@ def get_user_words(user_id: int):
     ]
 
 
+# =========================
+# WORD ADD / RESULT SAVE
+# =========================
 def add_word(eng: str, uzb: str, user_id: int, username: str | None, full_name: str | None):
     eng = normalize_text(eng)
     uzb = normalize_text(uzb)
@@ -480,10 +731,9 @@ def add_word(eng: str, uzb: str, user_id: int, username: str | None, full_name: 
             if normalize_text(row.get("source_type")) == "book":
                 continue
 
-            existing_eng = normalize_text(row["english"]).lower()
-            existing_uzb = normalize_text(row["uzbek"]).lower()
-
-            if existing_eng == eng_lower or existing_uzb == uzb_lower:
+            if normalize_text(row["english"]).lower() == eng_lower:
+                return "exists"
+            if normalize_text(row["uzbek"]).lower() == uzb_lower:
                 return "exists"
 
         words_sheet.append_row(
@@ -510,16 +760,9 @@ def add_word(eng: str, uzb: str, user_id: int, username: str | None, full_name: 
         return "error"
 
 
-def save_global_result(
-    user_id: int,
-    username: str | None,
-    full_name: str | None,
-    total: int,
-    correct: int,
-):
+def save_global_result(user_id: int, username: str | None, full_name: str | None, total: int, correct: int):
     percent = round((correct / total) * 100, 1) if total > 0 else 0
     score = correct
-
     username = normalize_text(username)
     full_name = normalize_text(full_name)
 
@@ -556,16 +799,12 @@ def get_leaderboard_users():
                 continue
 
             user_id_raw = normalize_text(str(row.get("user_id", "")))
-            username = normalize_text(str(row.get("username", "")))
-            full_name = normalize_text(str(row.get("full_name", "")))
-
-            try:
-                score = int(float(normalize_text(str(row.get("score", "0"))) or "0"))
-            except Exception:
-                score = 0
-
             if not user_id_raw:
                 continue
+
+            username = normalize_text(str(row.get("username", "")))
+            full_name = normalize_text(str(row.get("full_name", "")))
+            score = safe_int(row.get("score", 0))
 
             if user_id_raw not in score_map:
                 score_map[user_id_raw] = {
@@ -598,21 +837,22 @@ def get_user_total_global_score(user_id: int) -> int:
     try:
         records = get_results_records()
         total_score = 0
+
         for row in records:
             test_type = normalize_text(str(row.get("test_type", ""))).lower()
             row_user_id = normalize_text(str(row.get("user_id", "")))
-            if test_type != "global" or row_user_id != str(user_id):
-                continue
-            try:
-                total_score += int(float(normalize_text(str(row.get("score", "0"))) or "0"))
-            except Exception:
-                pass
+            if test_type == "global" and row_user_id == str(user_id):
+                total_score += safe_int(row.get("score", 0))
+
         return total_score
     except Exception as e:
         logger.exception("get_user_total_global_score error: %s", e)
         return 0
 
 
+# =========================
+# SMART REPETITION
+# =========================
 def merge_progress_delta_into_cache(user_id: int, delta_map: dict):
     current = get_user_progress_map(user_id)
     merged = {k: dict(v) for k, v in current.items()}
@@ -632,7 +872,7 @@ def merge_progress_delta_into_cache(user_id: int, delta_map: dict):
         if delta.get("last_result"):
             merged[key]["last_result"] = delta["last_result"]
 
-    PROGRESS_CACHE[user_id] = merged
+    PROGRESS_CACHE_BY_USER[user_id] = merged
     PROGRESS_CACHE_TS[user_id] = time.time()
 
 
@@ -658,14 +898,17 @@ def add_progress_delta(context: ContextTypes.DEFAULT_TYPE, user_id: int, english
         pending[key]["wrong_count"] += 1
         pending[key]["last_result"] = "wrong"
 
-    merge_progress_delta_into_cache(user_id, {
-        key: {
-            "seen_count": 1,
-            "correct_count": 1 if is_correct else 0,
-            "wrong_count": 0 if is_correct else 1,
-            "last_result": "correct" if is_correct else "wrong",
-        }
-    })
+    merge_progress_delta_into_cache(
+        user_id,
+        {
+            key: {
+                "seen_count": 1,
+                "correct_count": 1 if is_correct else 0,
+                "wrong_count": 0 if is_correct else 1,
+                "last_result": "correct" if is_correct else "wrong",
+            }
+        },
+    )
 
 
 def flush_progress_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int | None):
@@ -691,9 +934,9 @@ def flush_progress_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int | No
             key = f"{row_user_id}::{english}::{uzbek}"
             index_map[key] = {
                 "row_index": idx,
-                "seen_count": int(float(str(row.get("seen_count", 0)) or 0)),
-                "correct_count": int(float(str(row.get("correct_count", 0)) or 0)),
-                "wrong_count": int(float(str(row.get("wrong_count", 0)) or 0)),
+                "seen_count": safe_int(row.get("seen_count", 0)),
+                "correct_count": safe_int(row.get("correct_count", 0)),
+                "wrong_count": safe_int(row.get("wrong_count", 0)),
             }
 
         updates = []
@@ -710,27 +953,31 @@ def flush_progress_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int | No
                 new_correct = record["correct_count"] + delta["correct_count"]
                 new_wrong = record["wrong_count"] + delta["wrong_count"]
 
-                updates.append({
-                    "row_index": record["row_index"],
-                    "values": [
-                        str(new_seen),
-                        str(new_correct),
-                        str(new_wrong),
+                updates.append(
+                    {
+                        "row_index": record["row_index"],
+                        "values": [
+                            str(new_seen),
+                            str(new_correct),
+                            str(new_wrong),
+                            delta["last_result"],
+                            now_str(),
+                        ],
+                    }
+                )
+            else:
+                appends.append(
+                    [
+                        str(user_id),
+                        english,
+                        uzbek,
+                        str(delta["seen_count"]),
+                        str(delta["correct_count"]),
+                        str(delta["wrong_count"]),
                         delta["last_result"],
                         now_str(),
                     ]
-                })
-            else:
-                appends.append([
-                    str(user_id),
-                    english,
-                    uzbek,
-                    str(delta["seen_count"]),
-                    str(delta["correct_count"]),
-                    str(delta["wrong_count"]),
-                    delta["last_result"],
-                    now_str(),
-                ])
+                )
 
         for item in updates:
             progress_sheet.update(
@@ -792,6 +1039,7 @@ def build_weighted_words(words: list[dict], user_id: int, limit: int | None = No
         key = f"{normalize_text(word['english']).lower()}::{normalize_text(word['uzbek']).lower()}"
         if key in seen_keys:
             continue
+
         selected.append(word)
         seen_keys.add(key)
 
@@ -814,6 +1062,9 @@ def build_weighted_words(words: list[dict], user_id: int, limit: int | None = No
     return selected
 
 
+# =========================
+# TEST YORDAMCHI
+# =========================
 def get_random_incorrect(correct_word, all_words, lang="eng"):
     if lang == "eng":
         candidates = [w["english"] for w in all_words if normalize_text(w["english"]) != normalize_text(correct_word)]
@@ -836,15 +1087,59 @@ def build_test_queue(words: list[dict]) -> list[dict]:
 
     for word in words:
         q_type = "eng2uz" if random.random() < 0.5 else "uz2eng"
-        queue.append({
-            "q_type": q_type,
-            "correct": word,
-        })
+        queue.append({"q_type": q_type, "correct": word})
 
     random.shuffle(queue)
     return queue
 
 
+def clear_test_state(context: ContextTypes.DEFAULT_TYPE):
+    for key in [
+        "test_words",
+        "score",
+        "correct",
+        "q_type",
+        "test_queue",
+        "current_question",
+        "current_options",
+        "test_mode_type",
+        "wrong_answers",
+        "global_partial_saved",
+        "current_book_id",
+        "current_book_section",
+        "pending_progress_updates",
+    ]:
+        context.user_data.pop(key, None)
+
+
+def save_partial_global_result_if_needed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    test_mode_type = context.user_data.get("test_mode_type")
+    score = context.user_data.get("score", {"total": 0, "correct": 0})
+    already_saved = context.user_data.get("global_partial_saved", False)
+
+    if test_mode_type != "global":
+        return
+
+    if already_saved:
+        return
+
+    total = score.get("total", 0)
+    correct = score.get("correct", 0)
+
+    if total <= 0:
+        return
+
+    user_id, username, full_name = get_user_meta(update)
+    if user_id is None:
+        return
+
+    save_global_result(user_id, username, full_name, total, correct)
+    context.user_data["global_partial_saved"] = True
+
+
+# =========================
+# UI
+# =========================
 def build_pagination_markup(prefix: str, page: int, total_items: int, page_size: int):
     total_pages = max(1, (total_items + page_size - 1) // page_size)
     buttons = []
@@ -931,12 +1226,7 @@ def build_books_grid_markup(books: list[dict]):
     row = []
 
     for book in books:
-        row.append(
-            InlineKeyboardButton(
-                book["book_name"],
-                callback_data=f"book_open::{book['book_id']}",
-            )
-        )
+        row.append(InlineKeyboardButton(book["book_name"], callback_data=f"book_open::{book['book_id']}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -954,12 +1244,7 @@ def build_sections_grid_markup(book_id: str, sections: list[str]):
 
     for section in sections:
         safe_section = section.replace(" ", "_")
-        row.append(
-            InlineKeyboardButton(
-                section,
-                callback_data=f"book_section_open::{book_id}::{safe_section}",
-            )
-        )
+        row.append(InlineKeyboardButton(section, callback_data=f"book_section_open::{book_id}::{safe_section}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -972,50 +1257,30 @@ def build_sections_grid_markup(book_id: str, sections: list[str]):
     return InlineKeyboardMarkup(buttons)
 
 
-def build_rules_text():
-    return (
-        "ℹ️ Bot qoidalari va ishlash tartibi\n\n"
-        "Ushbu bot inglizcha-o'zbekcha so'zlarni o'rganish va test ishlash uchun yaratilgan.\n\n"
-        "🌍 Global test\n"
-        "Bu bo'limda barcha foydalanuvchilar qo'shgan oddiy so'zlardan test ishlanadi.\n"
-        "Har bir so'zdan faqat 1 ta savol tushadi. Savol yo'nalishi random bo'ladi.\n"
-        f"Global test maksimal {GLOBAL_TEST_MAX_QUESTIONS} ta savol bilan cheklanadi.\n"
-        "Agar testni oxirigacha ishlamasdan Menyu tugmasi bilan chiqib ketsangiz ham, ishlangan qism natijasi saqlanadi.\n"
-        "Faqat Global test uchun ball beriladi va Leaderboard shu bo'lim asosida shakllanadi.\n\n"
-        "👤 Mening testim\n"
-        "Bu bo'limda faqat siz qo'shgan oddiy so'zlardan test ishlaysiz.\n"
-        "Har bir so'zdan faqat 1 ta savol tushadi.\n"
-        "Bu mashq rejimi hisoblanadi va ball qo'shilmaydi.\n"
-        "Bot smart repetition mantiqidan foydalanadi: siz ko'proq xato qilgan so'zlar keyingi testlarda ko'proq tushadi.\n"
-        "Progress test davomida xotirada yig'iladi va test tugagach saqlanadi.\n"
-        "Test tugagach, xato ishlangan savollarni alohida qayta ishlash mumkin.\n\n"
-        "📘 Kitoblar bo'yicha testlar\n"
-        "Bu bo'limda kitoblar ro'yxati 2 ustunli inline tugmalarda ko'rsatiladi.\n"
-        "Kitob ichiga kirganda:\n"
-        "1. Kitob bo'yicha testni boshlash\n"
-        "2. Agar mavjud bo'lsa, bo'limlar bo'yicha test\n"
-        f"Kitob bo'yicha test maksimal {BOOK_TEST_MAX_QUESTIONS} ta savol bo'ladi.\n"
-        "Bo'lim bo'yicha test esa aynan o'sha bo'limdagi so'zlar sonicha bo'ladi.\n"
-        "Har bir so'zdan faqat 1 ta savol tushadi.\n\n"
-        "❌ Xatolarni qayta ishlash\n"
-        "Mening testim tugagandan keyin xato javob bergan savollar uchun alohida knopka chiqadi.\n"
-        "Bu bo'limda faqat xato ishlangan savollar qayta beriladi.\n\n"
-        "➕ So'z qo'shish\n"
-        "Yangi inglizcha-o'zbekcha so'z juftligini botga qo'shishingiz mumkin.\n"
-        "Har bir inglizcha so'z faqat 1 marta, har bir o'zbekcha so'z ham faqat 1 marta kiritiladi.\n\n"
-        "📚 Mening so'zlarim\n"
-        "Bu yerda siz qo'shgan oddiy so'zlarni ko'rasiz.\n\n"
-        "🌐 Global so'zlar\n"
-        "Bu bo'limda foydalanuvchilar qo'shgan oddiy so'zlar sahifalarga bo'lingan holda ko'rsatiladi.\n\n"
-        "🏆 Leaderboard\n"
-        "Bu bo'limda Global test bo'yicha barcha foydalanuvchilar ballari saralangan holda ko'rsatiladi.\n\n"
-        "Test tartibi:\n"
-        "Savolda ko'rinadigan so'zlar kichik harflarda chiqariladi.\n"
-        "Har bir savolda 1 ta to'g'ri javob va bir nechta random variant bo'ladi.\n"
-        "Barcha savollar tugagach, test yakunlanadi va natija ko'rsatiladi.\n\n"
-        "Taklif va murojaatlar uchun:\n"
-        "@abdurahmon_2909"
-    )
+def get_main_menu_markup() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("🌍 Global test", callback_data="global_test")],
+        [InlineKeyboardButton("👤 Mening testim", callback_data="my_test")],
+        [InlineKeyboardButton("➕ So'z qo'shish", callback_data="add")],
+        [InlineKeyboardButton("📚 Mening so'zlarim", callback_data="my_words_0")],
+        [InlineKeyboardButton("🌐 Global so'zlar", callback_data="global_words_0")],
+        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard_0")],
+        [InlineKeyboardButton("📘 Kitoblar bo'yicha testlar", callback_data="books_menu")],
+        [InlineKeyboardButton("ℹ️ Qoidalar", callback_data="rules")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_after_test_markup(test_mode_type: str | None, has_wrong_answers: bool):
+    buttons = []
+
+    if test_mode_type == "my" and has_wrong_answers:
+        buttons.append([InlineKeyboardButton("❌ Xatolarni qayta ishlash", callback_data="retry_wrong")])
+
+    buttons.append([InlineKeyboardButton("🔁 Yana test", callback_data="repeat_test")])
+    buttons.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
+
+    return InlineKeyboardMarkup(buttons)
 
 
 def get_start_text():
@@ -1046,36 +1311,43 @@ def get_start_text():
     return text
 
 
-def get_main_menu_markup() -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton("🌍 Global test", callback_data="global_test")],
-        [InlineKeyboardButton("👤 Mening testim", callback_data="my_test")],
-        [InlineKeyboardButton("➕ So'z qo'shish", callback_data="add")],
-        [InlineKeyboardButton("📚 Mening so'zlarim", callback_data="my_words_0")],
-        [InlineKeyboardButton("🌐 Global so'zlar", callback_data="global_words_0")],
-        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard_0")],
-        [InlineKeyboardButton("📘 Kitoblar bo'yicha testlar", callback_data="books_menu")],
-        [InlineKeyboardButton("ℹ️ Qoidalar", callback_data="rules")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+def build_rules_text():
+    return (
+        "ℹ️ Bot qoidalari va ishlash tartibi\n\n"
+        "🌍 Global test\n"
+        "Bu bo'limda foydalanuvchilar qo'shgan oddiy so'zlardan test ishlanadi.\n"
+        "Har bir so'zdan faqat 1 ta savol tushadi. Savol yo'nalishi random bo'ladi.\n"
+        f"Global test maksimal {GLOBAL_TEST_MAX_QUESTIONS} ta savol bilan cheklanadi.\n"
+        "Menyu bosib chiqib ketsangiz ham ishlangan qism natijasi saqlanadi.\n"
+        "Faqat Global test uchun ball beriladi va Leaderboard shu bo'lim asosida tuziladi.\n\n"
+        "👤 Mening testim\n"
+        "Bu bo'limda faqat siz qo'shgan oddiy so'zlardan test ishlaysiz.\n"
+        "Bu mashq rejimi, ball qo'shilmaydi.\n"
+        "Smart repetition ishlaydi: xato qilgan so'zlar keyingi testlarda ko'proq tushadi.\n"
+        "Progress test davomida xotirada yig'iladi va test tugagach saqlanadi.\n\n"
+        "📘 Kitoblar bo'yicha testlar\n"
+        "Kitoblar 2 ustunli inline tugmalarda ko'rsatiladi.\n"
+        "Kitob bo'yicha test maksimal 25 savol bo'ladi.\n"
+        "Bo'lim bo'yicha test esa shu bo'limdagi so'zlar sonicha bo'ladi.\n\n"
+        "❌ Xatolarni qayta ishlash\n"
+        "Mening testim tugagach, xato ishlangan savollarni alohida qayta ishlash mumkin.\n\n"
+        "📢 Admin panel\n"
+        "Admin /admin orqali statistika ko'rishi, text yoki rasmli broadcast yuborishi mumkin.\n\n"
+        "Test tartibi:\n"
+        "Savolda ko'rinadigan so'zlar kichik harflarda chiqariladi.\n"
+        "Har bir savolda 1 ta to'g'ri javob va bir nechta random variant bo'ladi.\n"
+        "Barcha savollar tugagach, test yakunlanadi va natija ko'rsatiladi.\n\n"
+        "Taklif va murojaatlar uchun:\n"
+        "@abdurahmon_2909"
+    )
 
 
-def get_after_test_markup(test_mode_type: str | None, has_wrong_answers: bool):
-    buttons = []
-
-    if test_mode_type == "my" and has_wrong_answers:
-        buttons.append([InlineKeyboardButton("❌ Xatolarni qayta ishlash", callback_data="retry_wrong")])
-
-    buttons.append([InlineKeyboardButton("🔁 Yana test", callback_data="repeat_test")])
-    buttons.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
-
-    return InlineKeyboardMarkup(buttons)
-
-
+# =========================
+# SAFE TELEGRAM YORDAMCHI
+# =========================
 async def safe_answer_callback(query):
     if not query:
         return False
-
     try:
         await query.answer()
         return True
@@ -1105,61 +1377,9 @@ async def safe_edit_or_send(query, text: str, reply_markup: InlineKeyboardMarkup
         logger.exception("reply_text error: %s", e)
 
 
-async def post_init(application: Application):
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        logger.warning("delete_webhook warning: %s", e)
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Unhandled exception:", exc_info=context.error)
-
-
-def clear_test_state(context: ContextTypes.DEFAULT_TYPE):
-    for key in [
-        "test_words",
-        "score",
-        "correct",
-        "q_type",
-        "test_queue",
-        "current_question",
-        "current_options",
-        "test_mode_type",
-        "wrong_answers",
-        "global_partial_saved",
-        "current_book_id",
-        "current_book_section",
-        "pending_progress_updates",
-    ]:
-        context.user_data.pop(key, None)
-
-
-def save_partial_global_result_if_needed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    test_mode_type = context.user_data.get("test_mode_type")
-    score = context.user_data.get("score", {"total": 0, "correct": 0})
-    already_saved = context.user_data.get("global_partial_saved", False)
-
-    if test_mode_type != "global":
-        return
-
-    if already_saved:
-        return
-
-    total = score.get("total", 0)
-    correct = score.get("correct", 0)
-
-    if total <= 0:
-        return
-
-    user_id, username, full_name = get_user_meta(update)
-    if user_id is None:
-        return
-
-    save_global_result(user_id, username, full_name, total, correct)
-    context.user_data["global_partial_saved"] = True
-
-
+# =========================
+# TEST FUNKSIYALARI
+# =========================
 async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update):
     score = context.user_data.get("score", {"total": 0, "correct": 0})
     total = score["total"]
@@ -1185,6 +1405,7 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
             f"🏅 Ushbu test uchun ball: {correct}\n"
             f"🔥 Umumiy global ballingiz: {total_global_score}"
         )
+
     elif test_mode_type == "my":
         text = (
             "✅ Mening testim tugadi!\n\n"
@@ -1192,6 +1413,7 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
             f"📈 Foiz: {percent}%\n\n"
             "Bu mashq rejimi, ball qo'shilmadi."
         )
+
     elif test_mode_type == "my_retry":
         text = (
             "✅ Xato savollar testi tugadi!\n\n"
@@ -1199,6 +1421,7 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
             f"📈 Foiz: {percent}%\n\n"
             "Bu mashq rejimi, ball qo'shilmadi."
         )
+
     elif test_mode_type == "book":
         book_id = context.user_data.get("current_book_id")
         book = get_book_by_id(book_id) if book_id else None
@@ -1210,6 +1433,7 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
             f"📈 Foiz: {percent}%\n\n"
             "Bu kitob bo'yicha mashq rejimi."
         )
+
     elif test_mode_type == "book_section":
         book_id = context.user_data.get("current_book_id")
         section = context.user_data.get("current_book_section", "")
@@ -1222,6 +1446,7 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
             f"📈 Foiz: {percent}%\n\n"
             "Bu bo'lim bo'yicha mashq rejimi."
         )
+
     else:
         text = (
             "✅ Test tugadi!\n\n"
@@ -1230,12 +1455,7 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
         )
 
     markup = get_after_test_markup(test_mode_type, has_wrong_answers)
-
-    await safe_edit_or_send(
-        query,
-        text,
-        reply_markup=markup,
-    )
+    await safe_edit_or_send(query, text, reply_markup=markup)
 
     if test_mode_type == "global":
         clear_test_state(context)
@@ -1257,531 +1477,6 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
             context.user_data.pop(key, None)
 
 
-# =========================
-# HANDLERS
-# =========================
-async def restart_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_partial_global_result_if_needed(update, context)
-
-    user_id, _, _ = get_user_meta(update)
-    if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
-        flush_progress_updates(context, user_id)
-
-    clear_test_state(context)
-    context.user_data.pop("eng", None)
-
-    if update.message:
-        await update.message.reply_text(
-            get_start_text(),
-            reply_markup=get_main_menu_markup(),
-        )
-    elif update.callback_query:
-        query = update.callback_query
-        await safe_answer_callback(query)
-        await safe_edit_or_send(
-            query,
-            get_start_text(),
-            reply_markup=get_main_menu_markup(),
-        )
-
-    return ConversationHandler.END
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_partial_global_result_if_needed(update, context)
-
-    user_id, _, _ = get_user_meta(update)
-    if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
-        flush_progress_updates(context, user_id)
-
-    clear_test_state(context)
-    context.user_data.pop("eng", None)
-    await update.message.reply_text(
-        get_start_text(),
-        reply_markup=get_main_menu_markup(),
-    )
-
-
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    save_partial_global_result_if_needed(update, context)
-
-    user_id, _, _ = get_user_meta(update)
-    if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
-        flush_progress_updates(context, user_id)
-
-    clear_test_state(context)
-    context.user_data.pop("eng", None)
-    await safe_edit_or_send(query, get_start_text(), reply_markup=get_main_menu_markup())
-
-
-async def leaderboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    data = query.data
-    page = 0
-    try:
-        page = int(data.split("_")[-1])
-    except Exception:
-        page = 0
-
-    users = get_leaderboard_users()
-    text, page = format_leaderboard_page(users, page, LEADERBOARD_PAGE_SIZE)
-    markup = build_pagination_markup("leaderboard", page, len(users), LEADERBOARD_PAGE_SIZE)
-    await safe_edit_or_send(query, text, reply_markup=markup)
-
-
-async def rules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-    await safe_edit_or_send(
-        query,
-        build_rules_text(),
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]
-        ),
-    )
-
-
-async def books_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    books = get_books()
-
-    if not books:
-        await safe_edit_or_send(
-            query,
-            "Hozircha kitoblar qo'shilmagan.",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]
-            ),
-        )
-        return
-
-    await safe_edit_or_send(
-        query,
-        "📘 Kitoblar bo'yicha testlar\n\nKerakli kitobni tanlang:",
-        reply_markup=build_books_grid_markup(books),
-    )
-
-
-async def book_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    data = query.data
-    book_id = data.split("::", 1)[1]
-    book = get_book_by_id(book_id)
-
-    if not book:
-        await safe_edit_or_send(
-            query,
-            "Kitob topilmadi.",
-            reply_markup=get_main_menu_markup(),
-        )
-        return
-
-    buttons = [
-        [InlineKeyboardButton("▶️ Kitob bo'yicha testni boshlash", callback_data=f"book_test::{book_id}")]
-    ]
-
-    if book["has_sections"]:
-        buttons.append([InlineKeyboardButton("📂 Bo'limlar bo'yicha test", callback_data=f"book_sections::{book_id}")])
-
-    buttons.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="books_menu")])
-    buttons.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
-
-    total_words = len(get_book_words(book_id))
-    text = (
-        f"📘 {book['book_name']}\n\n"
-        f"📚 Jami so'zlar: {total_words}\n"
-        f"📂 Bo'limlar: {book.get('total_sections') or '-'}\n\n"
-        "Kerakli amalni tanlang:"
-    )
-
-    await safe_edit_or_send(
-        query,
-        text,
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-
-
-async def book_sections_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    data = query.data
-    book_id = data.split("::", 1)[1]
-    book = get_book_by_id(book_id)
-
-    if not book:
-        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
-        return
-
-    sections = get_book_sections(book_id)
-    if not sections:
-        await safe_edit_or_send(
-            query,
-            "Bu kitob uchun bo'limlar topilmadi.",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_open::{book_id}")],
-                    [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
-                ]
-            ),
-        )
-        return
-
-    await safe_edit_or_send(
-        query,
-        f"📂 {book['book_name']} bo'limlari\n\nKerakli bo'limni tanlang:",
-        reply_markup=build_sections_grid_markup(book_id, sections),
-    )
-
-
-async def book_section_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    parts = query.data.split("::")
-    if len(parts) != 3:
-        await safe_edit_or_send(query, "Bo'lim ma'lumoti xato.", reply_markup=get_main_menu_markup())
-        return
-
-    book_id = parts[1]
-    section = parts[2].replace("_", " ")
-
-    book = get_book_by_id(book_id)
-    if not book:
-        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
-        return
-
-    words = get_section_words(book_id, section)
-    count = len(words)
-
-    buttons = [
-        [InlineKeyboardButton("▶️ Bo'lim bo'yicha testni boshlash", callback_data=f"book_section_test::{book_id}::{parts[2]}")],
-        [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_sections::{book_id}")],
-        [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
-    ]
-
-    text = (
-        f"📂 {book['book_name']} — {section}\n\n"
-        f"📚 Shu bo'limdagi so'zlar: {count}\n\n"
-        "Testni boshlash uchun tugmani bosing."
-    )
-
-    await safe_edit_or_send(query, text, reply_markup=InlineKeyboardMarkup(buttons))
-
-
-async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-    await safe_edit_or_send(query, "Inglizcha so'zni yozing:\n(Bekor qilish uchun /cancel yozing)")
-    return ENGLISH
-
-
-async def add_english(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = normalize_text(update.message.text if update.message else "")
-    if not text:
-        await update.message.reply_text("Iltimos, inglizcha so'zni yuboring.")
-        return ENGLISH
-
-    context.user_data["eng"] = text
-    await update.message.reply_text("O'zbekcha tarjimasini yozing:\n(Bekor qilish uchun /cancel yozing)")
-    return UZBEK
-
-
-async def add_uzbek(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    eng = normalize_text(context.user_data.get("eng", ""))
-    uzb = normalize_text(update.message.text if update.message else "")
-
-    if not eng:
-        await update.message.reply_text("⚠️ Avval inglizcha so'zni kiriting.")
-        return ConversationHandler.END
-
-    if not uzb:
-        await update.message.reply_text("⚠️ O'zbekcha tarjimani kiriting.")
-        return UZBEK
-
-    user_id, username, full_name = get_user_meta(update)
-    if user_id is None:
-        await update.message.reply_text("❌ Foydalanuvchi ma'lumoti topilmadi.")
-        return ConversationHandler.END
-
-    result = add_word(eng, uzb, user_id, username, full_name)
-
-    if result == "ok":
-        await update.message.reply_text(f"✅ So'z qo'shildi!\n📝 {eng} -> {uzb}")
-    elif result == "exists":
-        await update.message.reply_text(
-            "⚠️ Bu inglizcha yoki o'zbekcha so'z allaqachon mavjud!"
-        )
-    else:
-        await update.message.reply_text("❌ Xatolik!")
-
-    context.user_data.pop("eng", None)
-
-    await update.message.reply_text(
-        "Yana tanlang:",
-        reply_markup=get_main_menu_markup(),
-    )
-    return ConversationHandler.END
-
-
-async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_partial_global_result_if_needed(update, context)
-
-    user_id, _, _ = get_user_meta(update)
-    if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
-        flush_progress_updates(context, user_id)
-
-    clear_test_state(context)
-    context.user_data.pop("eng", None)
-
-    await update.message.reply_text(
-        "Bekor qilindi.",
-        reply_markup=get_main_menu_markup(),
-    )
-    return ConversationHandler.END
-
-
-async def my_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    data = query.data
-    page = 0
-    try:
-        page = int(data.split("_")[-1])
-    except Exception:
-        page = 0
-
-    user_id, _, _ = get_user_meta(update)
-    words = get_user_words(user_id) if user_id is not None else []
-
-    text, page = format_words_page("📚 Mening so'zlarim", words, page, MY_WORDS_PAGE_SIZE, show_owner=False)
-    markup = build_pagination_markup("my_words", page, len(words), MY_WORDS_PAGE_SIZE)
-    await safe_edit_or_send(query, text, reply_markup=markup)
-
-
-async def global_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    data = query.data
-    page = 0
-    try:
-        page = int(data.split("_")[-1])
-    except Exception:
-        page = 0
-
-    words = [w for w in get_all_words() if normalize_text(w.get("source_type")) != "book"]
-    text, page = format_words_page("🌐 Global so'zlar", words, page, GLOBAL_WORDS_PAGE_SIZE, show_owner=False)
-    markup = build_pagination_markup("global_words", page, len(words), GLOBAL_WORDS_PAGE_SIZE)
-    await safe_edit_or_send(query, text, reply_markup=markup)
-
-
-async def global_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    words = [w for w in get_all_words() if normalize_text(w.get("source_type")) != "book"]
-
-    if len(words) < 4:
-        await safe_edit_or_send(
-            query,
-            "Global test uchun kamida 4 ta so'z kerak!",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]
-            ),
-        )
-        return
-
-    selected_words = words[:]
-    random.shuffle(selected_words)
-    selected_words = selected_words[:min(GLOBAL_TEST_MAX_QUESTIONS, len(selected_words))]
-
-    context.user_data["test_words"] = selected_words
-    context.user_data["score"] = {"total": 0, "correct": 0}
-    context.user_data["test_queue"] = build_test_queue(selected_words)
-    context.user_data["test_mode_type"] = "global"
-    context.user_data["wrong_answers"] = []
-    context.user_data["global_partial_saved"] = False
-    context.user_data["pending_progress_updates"] = {}
-
-    await generate_question(update, context, query)
-
-
-async def my_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    user_id, _, _ = get_user_meta(update)
-    words = get_user_words(user_id) if user_id is not None else []
-
-    if len(words) < 4:
-        await safe_edit_or_send(
-            query,
-            "Mening testim uchun siz kamida 4 ta so'z qo'shgan bo'lishingiz kerak!",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]
-            ),
-        )
-        return
-
-    selected_words = build_weighted_words(
-        words,
-        user_id=user_id,
-        limit=min(MY_TEST_MAX_QUESTIONS, len(words)),
-    )
-
-    context.user_data["test_words"] = selected_words
-    context.user_data["score"] = {"total": 0, "correct": 0}
-    context.user_data["test_queue"] = build_test_queue(selected_words)
-    context.user_data["test_mode_type"] = "my"
-    context.user_data["wrong_answers"] = []
-    context.user_data["global_partial_saved"] = False
-    context.user_data["pending_progress_updates"] = {}
-
-    await generate_question(update, context, query)
-
-
-async def retry_wrong_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    wrongs = context.user_data.get("wrong_answers", [])
-
-    if not wrongs:
-        await safe_edit_or_send(
-            query,
-            "Xato ishlangan savollar topilmadi.",
-            reply_markup=get_main_menu_markup(),
-        )
-        return
-
-    retry_queue = wrongs[:]
-    random.shuffle(retry_queue)
-
-    context.user_data["test_words"] = [item["correct"] for item in retry_queue]
-    context.user_data["score"] = {"total": 0, "correct": 0}
-    context.user_data["test_queue"] = retry_queue
-    context.user_data["test_mode_type"] = "my_retry"
-    context.user_data["wrong_answers"] = []
-    context.user_data["global_partial_saved"] = False
-    context.user_data["pending_progress_updates"] = {}
-
-    await generate_question(update, context, query)
-
-
-async def repeat_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    await safe_edit_or_send(
-        query,
-        "Qaysi testni qayta ishlamoqchisiz?",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("🌍 Global test", callback_data="global_test")],
-                [InlineKeyboardButton("👤 Mening testim", callback_data="my_test")],
-                [InlineKeyboardButton("📘 Kitoblar bo'yicha testlar", callback_data="books_menu")],
-                [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
-            ]
-        ),
-    )
-
-
-async def book_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    book_id = query.data.split("::", 1)[1]
-    book = get_book_by_id(book_id)
-    if not book:
-        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
-        return
-
-    words = get_book_words(book_id)
-    if len(words) < 4:
-        await safe_edit_or_send(
-            query,
-            "Bu kitob bo'yicha test uchun yetarli so'z topilmadi.",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_open::{book_id}")],
-                    [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
-                ]
-            ),
-        )
-        return
-
-    selected_words = words[:]
-    random.shuffle(selected_words)
-    selected_words = selected_words[:min(BOOK_TEST_MAX_QUESTIONS, len(selected_words))]
-
-    context.user_data["test_words"] = selected_words
-    context.user_data["score"] = {"total": 0, "correct": 0}
-    context.user_data["test_queue"] = build_test_queue(selected_words)
-    context.user_data["test_mode_type"] = "book"
-    context.user_data["wrong_answers"] = []
-    context.user_data["global_partial_saved"] = False
-    context.user_data["current_book_id"] = book_id
-    context.user_data["current_book_section"] = ""
-    context.user_data["pending_progress_updates"] = {}
-
-    await generate_question(update, context, query)
-
-
-async def book_section_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await safe_answer_callback(query)
-
-    parts = query.data.split("::")
-    if len(parts) != 3:
-        await safe_edit_or_send(query, "Bo'lim ma'lumoti xato.", reply_markup=get_main_menu_markup())
-        return
-
-    book_id = parts[1]
-    section = parts[2].replace("_", " ")
-
-    book = get_book_by_id(book_id)
-    if not book:
-        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
-        return
-
-    words = get_section_words(book_id, section)
-    if len(words) < 2:
-        await safe_edit_or_send(
-            query,
-            "Bu bo'lim bo'yicha test uchun yetarli so'z topilmadi.",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_sections::{book_id}")],
-                    [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
-                ]
-            ),
-        )
-        return
-
-    context.user_data["test_words"] = words
-    context.user_data["score"] = {"total": 0, "correct": 0}
-    context.user_data["test_queue"] = build_test_queue(words)
-    context.user_data["test_mode_type"] = "book_section"
-    context.user_data["wrong_answers"] = []
-    context.user_data["global_partial_saved"] = False
-    context.user_data["current_book_id"] = book_id
-    context.user_data["current_book_section"] = section
-    context.user_data["pending_progress_updates"] = {}
-
-    await generate_question(update, context, query)
-
-
 async def generate_question(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1790,7 +1485,6 @@ async def generate_question(
 ):
     words = context.user_data.get("test_words", [])
     test_queue = context.user_data.get("test_queue", [])
-
     mode_type = context.user_data.get("test_mode_type")
 
     min_required = 4
@@ -1804,9 +1498,7 @@ async def generate_question(
             await safe_edit_or_send(
                 query,
                 "Test uchun yetarli so'z topilmadi.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]
-                ),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]),
             )
         return
 
@@ -1848,8 +1540,7 @@ async def generate_question(
 
     score = context.user_data["score"]
     total_questions = score["total"] + len(test_queue) + 1
-    used_count = score["total"]
-    remaining = total_questions - used_count
+    remaining = total_questions - score["total"]
 
     if mode_type == "global":
         mode_title = "🌍 Global test"
@@ -1861,10 +1552,7 @@ async def generate_question(
     elif mode_type == "book_section":
         book = get_book_by_id(context.user_data.get("current_book_id", ""))
         section = context.user_data.get("current_book_section", "")
-        if book:
-            mode_title = f"📂 {book['book_name']} — {section}"
-        else:
-            mode_title = f"📂 {section}"
+        mode_title = f"📂 {book['book_name']} — {section}" if book else f"📂 {section}"
     else:
         mode_title = "👤 Mening testim"
 
@@ -1880,20 +1568,429 @@ async def generate_question(
     final_text += score_text + question_text
 
     if query:
-        await safe_edit_or_send(
-            query,
-            final_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        await safe_edit_or_send(query, final_text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         if update.callback_query and update.callback_query.message:
-            await update.callback_query.message.reply_text(
-                final_text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
+            await update.callback_query.message.reply_text(final_text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# =========================
+# HANDLERLAR
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    save_partial_global_result_if_needed(update, context)
+
+    user_id, _, _ = get_user_meta(update)
+    if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
+        flush_progress_updates(context, user_id)
+
+    clear_test_state(context)
+    context.user_data.pop("eng", None)
+
+    await update.message.reply_text(get_start_text(), reply_markup=get_main_menu_markup())
+
+
+async def restart_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    save_partial_global_result_if_needed(update, context)
+
+    user_id, _, _ = get_user_meta(update)
+    if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
+        flush_progress_updates(context, user_id)
+
+    clear_test_state(context)
+    context.user_data.pop("eng", None)
+
+    if update.message:
+        await update.message.reply_text(get_start_text(), reply_markup=get_main_menu_markup())
+    elif update.callback_query:
+        query = update.callback_query
+        await safe_answer_callback(query)
+        await safe_edit_or_send(query, get_start_text(), reply_markup=get_main_menu_markup())
+
+    return ConversationHandler.END
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    save_partial_global_result_if_needed(update, context)
+
+    user_id, _, _ = get_user_meta(update)
+    if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
+        flush_progress_updates(context, user_id)
+
+    clear_test_state(context)
+    context.user_data.pop("eng", None)
+    await safe_edit_or_send(query, get_start_text(), reply_markup=get_main_menu_markup())
+
+
+async def leaderboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    try:
+        page = int(query.data.split("_")[-1])
+    except Exception:
+        page = 0
+
+    users = get_leaderboard_users()
+    text, page = format_leaderboard_page(users, page, LEADERBOARD_PAGE_SIZE)
+    markup = build_pagination_markup("leaderboard", page, len(users), LEADERBOARD_PAGE_SIZE)
+    await safe_edit_or_send(query, text, reply_markup=markup)
+
+
+async def rules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    await safe_edit_or_send(
+        query,
+        build_rules_text(),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]),
+    )
+
+
+# =========================
+# ADMIN PANEL
+# =========================
+async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+
+    if not is_admin(update):
+        await update.message.reply_text("❌ Siz admin emassiz.")
+        return ConversationHandler.END
+
+    await update.message.reply_text("🛠 Admin panel", reply_markup=build_admin_menu_markup())
+    return ADMIN_MENU
+
+
+async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    if not is_admin(update):
+        await safe_edit_or_send(query, "❌ Siz admin emassiz.")
+        return ConversationHandler.END
+
+    data = query.data
+
+    if data == "admin_stats":
+        await safe_edit_or_send(query, get_admin_stats_text(), reply_markup=build_admin_menu_markup())
+        return ADMIN_MENU
+
+    if data == "admin_broadcast_text":
+        await safe_edit_or_send(query, "📨 Broadcast uchun matn yuboring.\n\nBekor qilish: /cancel")
+        return BROADCAST_TEXT
+
+    if data == "admin_broadcast_photo":
+        await safe_edit_or_send(
+            query,
+            "🖼 Rasm yuboring.\nCaption yozsangiz, shu izoh bilan yuboriladi.\n\nBekor qilish: /cancel",
+        )
+        return BROADCAST_PHOTO
+
+    if data == "admin_cache_refresh":
+        invalidate_all_cache()
+        await safe_edit_or_send(query, "✅ Cache yangilandi.", reply_markup=build_admin_menu_markup())
+        return ADMIN_MENU
+
+    return ADMIN_MENU
+
+
+async def receive_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+
+    if not is_admin(update):
+        await update.message.reply_text("❌ Siz admin emassiz.")
+        return ConversationHandler.END
+
+    text = normalize_text(update.message.text)
+    if not text:
+        await update.message.reply_text("⚠️ Matn yuboring.")
+        return BROADCAST_TEXT
+
+    await update.message.reply_text("📤 Yuborilmoqda...")
+
+    stats = await broadcast_to_all_users(
+        bot=context.bot,
+        text=text,
+    )
+
+    report = (
+        "✅ Broadcast tugadi\n\n"
+        f"👥 Jami user: {stats['total']}\n"
+        f"📨 Yuborildi: {stats['success']}\n"
+        f"❌ Xatolik: {stats['failed']}\n"
+        f"🚫 Block qilganlar: {stats['blocked']}"
+    )
+
+    await update.message.reply_text(report, reply_markup=build_admin_menu_markup())
+    return ADMIN_MENU
+
+
+async def receive_broadcast_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+
+    if not is_admin(update):
+        await update.message.reply_text("❌ Siz admin emassiz.")
+        return ConversationHandler.END
+
+    if not update.message.photo:
+        await update.message.reply_text("⚠️ Iltimos, rasm yuboring.")
+        return BROADCAST_PHOTO
+
+    photo = update.message.photo[-1]
+    photo_file_id = photo.file_id
+    caption = normalize_text(update.message.caption)
+
+    await update.message.reply_text("📤 Rasmli xabar yuborilmoqda...")
+
+    stats = await broadcast_to_all_users(
+        bot=context.bot,
+        photo_file_id=photo_file_id,
+        caption=caption,
+    )
+
+    report = (
+        "✅ Rasmli broadcast tugadi\n\n"
+        f"👥 Jami user: {stats['total']}\n"
+        f"🖼 Yuborildi: {stats['success']}\n"
+        f"❌ Xatolik: {stats['failed']}\n"
+        f"🚫 Block qilganlar: {stats['blocked']}"
+    )
+
+    await update.message.reply_text(report, reply_markup=build_admin_menu_markup())
+    return ADMIN_MENU
+
+
+async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text("Bekor qilindi.")
+    return ConversationHandler.END
+
+
+# =========================
+# SO'Z QO'SHISH
+# =========================
+async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+    await safe_edit_or_send(query, "Inglizcha so'zni yozing:\n(Bekor qilish uchun /cancel yozing)")
+    return ENGLISH
+
+
+async def add_english(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    text = normalize_text(update.message.text if update.message else "")
+    if not text:
+        await update.message.reply_text("Iltimos, inglizcha so'zni yuboring.")
+        return ENGLISH
+
+    context.user_data["eng"] = text
+    await update.message.reply_text("O'zbekcha tarjimasini yozing:\n(Bekor qilish uchun /cancel yozing)")
+    return UZBEK
+
+
+async def add_uzbek(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+
+    eng = normalize_text(context.user_data.get("eng", ""))
+    uzb = normalize_text(update.message.text if update.message else "")
+
+    if not eng:
+        await update.message.reply_text("⚠️ Avval inglizcha so'zni kiriting.")
+        return ConversationHandler.END
+
+    if not uzb:
+        await update.message.reply_text("⚠️ O'zbekcha tarjimani kiriting.")
+        return UZBEK
+
+    user_id, username, full_name = get_user_meta(update)
+    if user_id is None:
+        await update.message.reply_text("❌ Foydalanuvchi ma'lumoti topilmadi.")
+        return ConversationHandler.END
+
+    result = add_word(eng, uzb, user_id, username, full_name)
+
+    if result == "ok":
+        await update.message.reply_text(f"✅ So'z qo'shildi!\n📝 {eng} -> {uzb}")
+    elif result == "exists":
+        await update.message.reply_text("⚠️ Bu inglizcha yoki o'zbekcha so'z allaqachon mavjud!")
+    else:
+        await update.message.reply_text("❌ Xatolik!")
+
+    context.user_data.pop("eng", None)
+    await update.message.reply_text("Yana tanlang:", reply_markup=get_main_menu_markup())
+    return ConversationHandler.END
+
+
+async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    save_partial_global_result_if_needed(update, context)
+
+    user_id, _, _ = get_user_meta(update)
+    if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
+        flush_progress_updates(context, user_id)
+
+    clear_test_state(context)
+    context.user_data.pop("eng", None)
+
+    await update.message.reply_text("Bekor qilindi.", reply_markup=get_main_menu_markup())
+    return ConversationHandler.END
+
+
+# =========================
+# RO'YXATLAR
+# =========================
+async def my_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    try:
+        page = int(query.data.split("_")[-1])
+    except Exception:
+        page = 0
+
+    user_id, _, _ = get_user_meta(update)
+    words = get_user_words(user_id) if user_id is not None else []
+
+    text, page = format_words_page("📚 Mening so'zlarim", words, page, MY_WORDS_PAGE_SIZE)
+    markup = build_pagination_markup("my_words", page, len(words), MY_WORDS_PAGE_SIZE)
+    await safe_edit_or_send(query, text, reply_markup=markup)
+
+
+async def global_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    try:
+        page = int(query.data.split("_")[-1])
+    except Exception:
+        page = 0
+
+    words = [w for w in get_all_words() if normalize_text(w.get("source_type")) != "book"]
+    text, page = format_words_page("🌐 Global so'zlar", words, page, GLOBAL_WORDS_PAGE_SIZE)
+    markup = build_pagination_markup("global_words", page, len(words), GLOBAL_WORDS_PAGE_SIZE)
+    await safe_edit_or_send(query, text, reply_markup=markup)
+
+
+# =========================
+# TESTLAR
+# =========================
+async def global_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    words = [w for w in get_all_words() if normalize_text(w.get("source_type")) != "book"]
+
+    if len(words) < 4:
+        await safe_edit_or_send(
+            query,
+            "Global test uchun kamida 4 ta so'z kerak!",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]),
+        )
+        return
+
+    selected_words = words[:]
+    random.shuffle(selected_words)
+    selected_words = selected_words[: min(GLOBAL_TEST_MAX_QUESTIONS, len(selected_words))]
+
+    context.user_data["test_words"] = selected_words
+    context.user_data["score"] = {"total": 0, "correct": 0}
+    context.user_data["test_queue"] = build_test_queue(selected_words)
+    context.user_data["test_mode_type"] = "global"
+    context.user_data["wrong_answers"] = []
+    context.user_data["global_partial_saved"] = False
+    context.user_data["pending_progress_updates"] = {}
+
+    await generate_question(update, context, query)
+
+
+async def my_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    user_id, _, _ = get_user_meta(update)
+    words = get_user_words(user_id) if user_id is not None else []
+
+    if len(words) < 4:
+        await safe_edit_or_send(
+            query,
+            "Mening testim uchun siz kamida 4 ta so'z qo'shgan bo'lishingiz kerak!",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]),
+        )
+        return
+
+    selected_words = build_weighted_words(words, user_id=user_id, limit=min(MY_TEST_MAX_QUESTIONS, len(words)))
+
+    context.user_data["test_words"] = selected_words
+    context.user_data["score"] = {"total": 0, "correct": 0}
+    context.user_data["test_queue"] = build_test_queue(selected_words)
+    context.user_data["test_mode_type"] = "my"
+    context.user_data["wrong_answers"] = []
+    context.user_data["global_partial_saved"] = False
+    context.user_data["pending_progress_updates"] = {}
+
+    await generate_question(update, context, query)
+
+
+async def retry_wrong_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    wrongs = context.user_data.get("wrong_answers", [])
+    if not wrongs:
+        await safe_edit_or_send(query, "Xato ishlangan savollar topilmadi.", reply_markup=get_main_menu_markup())
+        return
+
+    retry_queue = wrongs[:]
+    random.shuffle(retry_queue)
+
+    context.user_data["test_words"] = [item["correct"] for item in retry_queue]
+    context.user_data["score"] = {"total": 0, "correct": 0}
+    context.user_data["test_queue"] = retry_queue
+    context.user_data["test_mode_type"] = "my_retry"
+    context.user_data["wrong_answers"] = []
+    context.user_data["global_partial_saved"] = False
+    context.user_data["pending_progress_updates"] = {}
+
+    await generate_question(update, context, query)
+
+
+async def repeat_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    await safe_edit_or_send(
+        query,
+        "Qaysi testni qayta ishlamoqchisiz?",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🌍 Global test", callback_data="global_test")],
+                [InlineKeyboardButton("👤 Mening testim", callback_data="my_test")],
+                [InlineKeyboardButton("📘 Kitoblar bo'yicha testlar", callback_data="books_menu")],
+                [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
+            ]
+        ),
+    )
 
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
     query = update.callback_query
 
     answered = await safe_answer_callback(query)
@@ -1901,11 +1998,7 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if "current_question" not in context.user_data:
-        await safe_edit_or_send(
-            query,
-            "⚠️ Test holati topilmadi. Qaytadan boshlang.",
-            reply_markup=get_main_menu_markup(),
-        )
+        await safe_edit_or_send(query, "⚠️ Test holati topilmadi. Qaytadan boshlang.", reply_markup=get_main_menu_markup())
         return
 
     data = query.data
@@ -1914,11 +2007,7 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     options = context.user_data.get("current_options", [])
 
     if not correct or not q_type or not options:
-        await safe_edit_or_send(
-            query,
-            "⚠️ Test holati topilmadi. Qaytadan boshlang.",
-            reply_markup=get_main_menu_markup(),
-        )
+        await safe_edit_or_send(query, "⚠️ Test holati topilmadi. Qaytadan boshlang.", reply_markup=get_main_menu_markup())
         return
 
     context.user_data["score"]["total"] += 1
@@ -1935,11 +2024,7 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             raise ValueError("Unknown callback prefix")
     except Exception:
-        await safe_edit_or_send(
-            query,
-            "⚠️ Javobni qayta ishlashda xatolik. Qaytadan boshlang.",
-            reply_markup=get_main_menu_markup(),
-        )
+        await safe_edit_or_send(query, "⚠️ Javobni qayta ishlashda xatolik. Qaytadan boshlang.", reply_markup=get_main_menu_markup())
         return
 
     if is_correct:
@@ -1948,12 +2033,7 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
             wrong_answers = context.user_data.get("wrong_answers", [])
-            wrong_answers.append(
-                {
-                    "q_type": q_type,
-                    "correct": correct,
-                }
-            )
+            wrong_answers.append({"q_type": q_type, "correct": correct})
             context.user_data["wrong_answers"] = wrong_answers
 
         if q_type == "eng2uz":
@@ -1974,6 +2054,229 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     await generate_question(update, context, query, feedback_text=feedback_text)
+
+
+# =========================
+# KITOBLAR
+# =========================
+async def books_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    books = get_books()
+    if not books:
+        await safe_edit_or_send(
+            query,
+            "Hozircha kitoblar qo'shilmagan.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menyu", callback_data="menu")]]),
+        )
+        return
+
+    await safe_edit_or_send(
+        query,
+        "📘 Kitoblar bo'yicha testlar\n\nKerakli kitobni tanlang:",
+        reply_markup=build_books_grid_markup(books),
+    )
+
+
+async def book_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    book_id = query.data.split("::", 1)[1]
+    book = get_book_by_id(book_id)
+
+    if not book:
+        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
+        return
+
+    buttons = [[InlineKeyboardButton("▶️ Kitob bo'yicha testni boshlash", callback_data=f"book_test::{book_id}")]]
+    if book["has_sections"]:
+        buttons.append([InlineKeyboardButton("📂 Bo'limlar bo'yicha test", callback_data=f"book_sections::{book_id}")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="books_menu")])
+    buttons.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
+
+    total_words = len(get_book_words(book_id))
+    text = (
+        f"📘 {book['book_name']}\n\n"
+        f"📚 Jami so'zlar: {total_words}\n"
+        f"📂 Bo'limlar: {book.get('total_sections') or '-'}\n\n"
+        "Kerakli amalni tanlang:"
+    )
+
+    await safe_edit_or_send(query, text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def book_sections_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    book_id = query.data.split("::", 1)[1]
+    book = get_book_by_id(book_id)
+
+    if not book:
+        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
+        return
+
+    sections = get_book_sections(book_id)
+    if not sections:
+        await safe_edit_or_send(
+            query,
+            "Bu kitob uchun bo'limlar topilmadi.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_open::{book_id}")],
+                    [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
+                ]
+            ),
+        )
+        return
+
+    await safe_edit_or_send(
+        query,
+        f"📂 {book['book_name']} bo'limlari\n\nKerakli bo'limni tanlang:",
+        reply_markup=build_sections_grid_markup(book_id, sections),
+    )
+
+
+async def book_section_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    parts = query.data.split("::")
+    if len(parts) != 3:
+        await safe_edit_or_send(query, "Bo'lim ma'lumoti xato.", reply_markup=get_main_menu_markup())
+        return
+
+    book_id = parts[1]
+    section = parts[2].replace("_", " ")
+    book = get_book_by_id(book_id)
+
+    if not book:
+        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
+        return
+
+    words = get_section_words(book_id, section)
+    count = len(words)
+
+    buttons = [
+        [InlineKeyboardButton("▶️ Bo'lim bo'yicha testni boshlash", callback_data=f"book_section_test::{book_id}::{parts[2]}")],
+        [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_sections::{book_id}")],
+        [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
+    ]
+
+    text = (
+        f"📂 {book['book_name']} — {section}\n\n"
+        f"📚 Shu bo'limdagi so'zlar: {count}\n\n"
+        "Testni boshlash uchun tugmani bosing."
+    )
+
+    await safe_edit_or_send(query, text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def book_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    book_id = query.data.split("::", 1)[1]
+    book = get_book_by_id(book_id)
+    if not book:
+        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
+        return
+
+    words = get_book_words(book_id)
+    if len(words) < 4:
+        await safe_edit_or_send(
+            query,
+            "Bu kitob bo'yicha test uchun yetarli so'z topilmadi.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_open::{book_id}")],
+                    [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
+                ]
+            ),
+        )
+        return
+
+    selected_words = words[:]
+    random.shuffle(selected_words)
+    selected_words = selected_words[: min(BOOK_TEST_MAX_QUESTIONS, len(selected_words))]
+
+    context.user_data["test_words"] = selected_words
+    context.user_data["score"] = {"total": 0, "correct": 0}
+    context.user_data["test_queue"] = build_test_queue(selected_words)
+    context.user_data["test_mode_type"] = "book"
+    context.user_data["wrong_answers"] = []
+    context.user_data["global_partial_saved"] = False
+    context.user_data["current_book_id"] = book_id
+    context.user_data["current_book_section"] = ""
+    context.user_data["pending_progress_updates"] = {}
+
+    await generate_question(update, context, query)
+
+
+async def book_section_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_or_update_user(update)
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    parts = query.data.split("::")
+    if len(parts) != 3:
+        await safe_edit_or_send(query, "Bo'lim ma'lumoti xato.", reply_markup=get_main_menu_markup())
+        return
+
+    book_id = parts[1]
+    section = parts[2].replace("_", " ")
+    book = get_book_by_id(book_id)
+    if not book:
+        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
+        return
+
+    words = get_section_words(book_id, section)
+    if len(words) < 2:
+        await safe_edit_or_send(
+            query,
+            "Bu bo'lim bo'yicha test uchun yetarli so'z topilmadi.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_sections::{book_id}")],
+                    [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
+                ]
+            ),
+        )
+        return
+
+    context.user_data["test_words"] = words
+    context.user_data["score"] = {"total": 0, "correct": 0}
+    context.user_data["test_queue"] = build_test_queue(words)
+    context.user_data["test_mode_type"] = "book_section"
+    context.user_data["wrong_answers"] = []
+    context.user_data["global_partial_saved"] = False
+    context.user_data["current_book_id"] = book_id
+    context.user_data["current_book_section"] = section
+    context.user_data["pending_progress_updates"] = {}
+
+    await generate_question(update, context, query)
+
+
+# =========================
+# SYSTEM
+# =========================
+async def post_init(application: Application):
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning("delete_webhook warning: %s", e)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception:", exc_info=context.error)
 
 
 # =========================
@@ -2001,9 +2304,31 @@ def main():
         allow_reentry=True,
     )
 
+    admin_conv = ConversationHandler(
+        entry_points=[CommandHandler("admin", admin_start)],
+        states={
+            ADMIN_MENU: [
+                CallbackQueryHandler(
+                    admin_menu_callback,
+                    pattern=r"^(admin_stats|admin_broadcast_text|admin_broadcast_photo|admin_cache_refresh)$",
+                ),
+            ],
+            BROADCAST_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast_text),
+            ],
+            BROADCAST_PHOTO: [
+                MessageHandler(filters.PHOTO, receive_broadcast_photo),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin_cancel)],
+        allow_reentry=True,
+    )
+
     app.add_error_handler(error_handler)
 
     app.add_handler(add_conv)
+    app.add_handler(admin_conv)
+
     app.add_handler(CommandHandler("start", start))
 
     app.add_handler(CallbackQueryHandler(menu, pattern="^menu$"))
@@ -2011,15 +2336,18 @@ def main():
     app.add_handler(CallbackQueryHandler(my_test_handler, pattern="^my_test$"))
     app.add_handler(CallbackQueryHandler(retry_wrong_handler, pattern="^retry_wrong$"))
     app.add_handler(CallbackQueryHandler(repeat_test_handler, pattern="^repeat_test$"))
+
     app.add_handler(CallbackQueryHandler(my_words_handler, pattern=r"^my_words_\d+$"))
     app.add_handler(CallbackQueryHandler(global_words_handler, pattern=r"^global_words_\d+$"))
     app.add_handler(CallbackQueryHandler(leaderboard_handler, pattern=r"^leaderboard_\d+$"))
+
     app.add_handler(CallbackQueryHandler(books_menu_handler, pattern="^books_menu$"))
     app.add_handler(CallbackQueryHandler(book_open_handler, pattern=r"^book_open::"))
     app.add_handler(CallbackQueryHandler(book_sections_handler, pattern=r"^book_sections::"))
     app.add_handler(CallbackQueryHandler(book_section_open_handler, pattern=r"^book_section_open::"))
     app.add_handler(CallbackQueryHandler(book_test_handler, pattern=r"^book_test::"))
     app.add_handler(CallbackQueryHandler(book_section_test_handler, pattern=r"^book_section_test::"))
+
     app.add_handler(CallbackQueryHandler(rules_handler, pattern="^rules$"))
     app.add_handler(CallbackQueryHandler(check_answer, pattern=r"^(eng_|uz_)\d+$"))
 
