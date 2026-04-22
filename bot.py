@@ -51,9 +51,19 @@ TOP_LIMIT = 5
 
 WORDS_CACHE = []
 LAST_FETCH = 0
+
 BOOKS_CACHE = []
 LAST_BOOKS_FETCH = 0
-CACHE_TTL = 300  # 5 minut
+
+RESULTS_CACHE = []
+LAST_RESULTS_FETCH = 0
+
+PROGRESS_CACHE = {}
+PROGRESS_CACHE_TS = {}
+
+CACHE_TTL = 300
+RESULTS_CACHE_TTL = 60
+PROGRESS_CACHE_TTL = 120
 
 GLOBAL_TEST_MAX_QUESTIONS = 25
 MY_TEST_MAX_QUESTIONS = 25
@@ -82,7 +92,7 @@ def ensure_worksheet(name: str, headers: list[str]):
     try:
         ws = spreadsheet.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=name, rows=2000, cols=max(20, len(headers)))
+        ws = spreadsheet.add_worksheet(title=name, rows=4000, cols=max(20, len(headers)))
         ws.append_row(headers)
         return ws
 
@@ -210,12 +220,37 @@ def get_user_meta(update: Update):
     return user_id, username, full_name
 
 
-def invalidate_cache():
-    global WORDS_CACHE, LAST_FETCH, BOOKS_CACHE, LAST_BOOKS_FETCH
+def invalidate_words_cache():
+    global WORDS_CACHE, LAST_FETCH
     WORDS_CACHE = []
     LAST_FETCH = 0
+
+
+def invalidate_books_cache():
+    global BOOKS_CACHE, LAST_BOOKS_FETCH
     BOOKS_CACHE = []
     LAST_BOOKS_FETCH = 0
+
+
+def invalidate_results_cache():
+    global RESULTS_CACHE, LAST_RESULTS_FETCH
+    RESULTS_CACHE = []
+    LAST_RESULTS_FETCH = 0
+
+
+def invalidate_progress_cache_for_user(user_id: int):
+    if user_id in PROGRESS_CACHE:
+        PROGRESS_CACHE.pop(user_id, None)
+    if user_id in PROGRESS_CACHE_TS:
+        PROGRESS_CACHE_TS.pop(user_id, None)
+
+
+def invalidate_all_cache():
+    invalidate_words_cache()
+    invalidate_books_cache()
+    invalidate_results_cache()
+    PROGRESS_CACHE.clear()
+    PROGRESS_CACHE_TS.clear()
 
 
 def get_all_words(force_refresh: bool = False):
@@ -323,6 +358,63 @@ def get_books(force_refresh: bool = False):
         return BOOKS_CACHE if BOOKS_CACHE else []
 
 
+def get_results_records(force_refresh: bool = False):
+    global RESULTS_CACHE, LAST_RESULTS_FETCH
+
+    try:
+        now = time.time()
+        if not force_refresh and RESULTS_CACHE and (now - LAST_RESULTS_FETCH < RESULTS_CACHE_TTL):
+            return RESULTS_CACHE
+
+        RESULTS_CACHE = results_sheet.get_all_records()
+        LAST_RESULTS_FETCH = now
+        return RESULTS_CACHE
+    except Exception as e:
+        logger.exception("get_results_records error: %s", e)
+        return RESULTS_CACHE if RESULTS_CACHE else []
+
+
+def get_user_progress_map(user_id: int, force_refresh: bool = False) -> dict:
+    now = time.time()
+
+    if (
+        not force_refresh
+        and user_id in PROGRESS_CACHE
+        and user_id in PROGRESS_CACHE_TS
+        and (now - PROGRESS_CACHE_TS[user_id] < PROGRESS_CACHE_TTL)
+    ):
+        return PROGRESS_CACHE[user_id]
+
+    try:
+        records = progress_sheet.get_all_records()
+        progress_map = {}
+
+        for row in records:
+            row_user_id = normalize_text(str(row.get("user_id", "")))
+            if row_user_id != str(user_id):
+                continue
+
+            english = normalize_text(row.get("english"))
+            uzbek = normalize_text(row.get("uzbek"))
+            if not english or not uzbek:
+                continue
+
+            key = f"{english.lower()}::{uzbek.lower()}"
+            progress_map[key] = {
+                "seen_count": int(float(str(row.get("seen_count", 0)) or 0)),
+                "correct_count": int(float(str(row.get("correct_count", 0)) or 0)),
+                "wrong_count": int(float(str(row.get("wrong_count", 0)) or 0)),
+                "last_result": normalize_text(row.get("last_result")),
+            }
+
+        PROGRESS_CACHE[user_id] = progress_map
+        PROGRESS_CACHE_TS[user_id] = now
+        return progress_map
+    except Exception as e:
+        logger.exception("get_user_progress_map error: %s", e)
+        return PROGRESS_CACHE.get(user_id, {})
+
+
 def get_book_by_id(book_id: str):
     for book in get_books():
         if book["book_id"] == book_id:
@@ -409,7 +501,7 @@ def add_word(eng: str, uzb: str, user_id: int, username: str | None, full_name: 
             ]
         )
 
-        invalidate_cache()
+        invalidate_words_cache()
         get_all_words(force_refresh=True)
         return "ok"
 
@@ -448,16 +540,9 @@ def save_global_result(
                 now_str(),
             ]
         )
+        invalidate_results_cache()
     except Exception as e:
         logger.exception("save_global_result error: %s", e)
-
-
-def get_results_records():
-    try:
-        return results_sheet.get_all_records()
-    except Exception as e:
-        logger.exception("get_results_records error: %s", e)
-        return []
 
 
 def get_leaderboard_users():
@@ -528,103 +613,139 @@ def get_user_total_global_score(user_id: int) -> int:
         return 0
 
 
-def get_progress_records():
-    try:
-        return progress_sheet.get_all_records()
-    except Exception as e:
-        logger.exception("get_progress_records error: %s", e)
-        return []
+def merge_progress_delta_into_cache(user_id: int, delta_map: dict):
+    current = get_user_progress_map(user_id)
+    merged = {k: dict(v) for k, v in current.items()}
+
+    for key, delta in delta_map.items():
+        if key not in merged:
+            merged[key] = {
+                "seen_count": 0,
+                "correct_count": 0,
+                "wrong_count": 0,
+                "last_result": "",
+            }
+
+        merged[key]["seen_count"] += delta.get("seen_count", 0)
+        merged[key]["correct_count"] += delta.get("correct_count", 0)
+        merged[key]["wrong_count"] += delta.get("wrong_count", 0)
+        if delta.get("last_result"):
+            merged[key]["last_result"] = delta["last_result"]
+
+    PROGRESS_CACHE[user_id] = merged
+    PROGRESS_CACHE_TS[user_id] = time.time()
 
 
-def get_user_progress_map(user_id: int) -> dict:
-    records = get_progress_records()
-    progress_map = {}
+def add_progress_delta(context: ContextTypes.DEFAULT_TYPE, user_id: int, english: str, uzbek: str, is_correct: bool):
+    pending = context.user_data.setdefault("pending_progress_updates", {})
+    key = f"{normalize_text(english).lower()}::{normalize_text(uzbek).lower()}"
 
-    for row in records:
-        row_user_id = normalize_text(str(row.get("user_id", "")))
-        if row_user_id != str(user_id):
-            continue
-
-        english = normalize_text(row.get("english"))
-        uzbek = normalize_text(row.get("uzbek"))
-        if not english or not uzbek:
-            continue
-
-        key = f"{english.lower()}::{uzbek.lower()}"
-        progress_map[key] = {
-            "seen_count": int(float(str(row.get("seen_count", 0)) or 0)),
-            "correct_count": int(float(str(row.get("correct_count", 0)) or 0)),
-            "wrong_count": int(float(str(row.get("wrong_count", 0)) or 0)),
-            "last_result": normalize_text(row.get("last_result")),
+    if key not in pending:
+        pending[key] = {
+            "english": normalize_text(english),
+            "uzbek": normalize_text(uzbek),
+            "seen_count": 0,
+            "correct_count": 0,
+            "wrong_count": 0,
+            "last_result": "",
         }
 
-    return progress_map
+    pending[key]["seen_count"] += 1
+    if is_correct:
+        pending[key]["correct_count"] += 1
+        pending[key]["last_result"] = "correct"
+    else:
+        pending[key]["wrong_count"] += 1
+        pending[key]["last_result"] = "wrong"
+
+    merge_progress_delta_into_cache(user_id, {
+        key: {
+            "seen_count": 1,
+            "correct_count": 1 if is_correct else 0,
+            "wrong_count": 0 if is_correct else 1,
+            "last_result": "correct" if is_correct else "wrong",
+        }
+    })
 
 
-def update_word_progress(
-    user_id: int,
-    english: str,
-    uzbek: str,
-    is_correct: bool,
-):
+def flush_progress_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int | None):
+    if user_id is None:
+        context.user_data.pop("pending_progress_updates", None)
+        return
+
+    pending = context.user_data.get("pending_progress_updates", {})
+    if not pending:
+        return
+
     try:
-        records = progress_sheet.get_all_records()
+        existing_records = progress_sheet.get_all_records()
+        index_map = {}
 
-        target_row_index = None
-        english_l = normalize_text(english).lower()
-        uzbek_l = normalize_text(uzbek).lower()
-
-        for idx, row in enumerate(records, start=2):
+        for idx, row in enumerate(existing_records, start=2):
             row_user_id = normalize_text(str(row.get("user_id", "")))
-            row_english = normalize_text(row.get("english")).lower()
-            row_uzbek = normalize_text(row.get("uzbek")).lower()
+            english = normalize_text(row.get("english")).lower()
+            uzbek = normalize_text(row.get("uzbek")).lower()
+            if not row_user_id or not english or not uzbek:
+                continue
 
-            if row_user_id == str(user_id) and row_english == english_l and row_uzbek == uzbek_l:
-                target_row_index = idx
-                break
+            key = f"{row_user_id}::{english}::{uzbek}"
+            index_map[key] = {
+                "row_index": idx,
+                "seen_count": int(float(str(row.get("seen_count", 0)) or 0)),
+                "correct_count": int(float(str(row.get("correct_count", 0)) or 0)),
+                "wrong_count": int(float(str(row.get("wrong_count", 0)) or 0)),
+            }
 
-        if target_row_index is None:
-            seen_count = 1
-            correct_count = 1 if is_correct else 0
-            wrong_count = 0 if is_correct else 1
-            last_result = "correct" if is_correct else "wrong"
+        updates = []
+        appends = []
 
-            progress_sheet.append_row(
-                [
+        for _, delta in pending.items():
+            english = delta["english"]
+            uzbek = delta["uzbek"]
+            idx_key = f"{user_id}::{english.lower()}::{uzbek.lower()}"
+
+            if idx_key in index_map:
+                record = index_map[idx_key]
+                new_seen = record["seen_count"] + delta["seen_count"]
+                new_correct = record["correct_count"] + delta["correct_count"]
+                new_wrong = record["wrong_count"] + delta["wrong_count"]
+
+                updates.append({
+                    "row_index": record["row_index"],
+                    "values": [
+                        str(new_seen),
+                        str(new_correct),
+                        str(new_wrong),
+                        delta["last_result"],
+                        now_str(),
+                    ]
+                })
+            else:
+                appends.append([
                     str(user_id),
                     english,
                     uzbek,
-                    str(seen_count),
-                    str(correct_count),
-                    str(wrong_count),
-                    last_result,
+                    str(delta["seen_count"]),
+                    str(delta["correct_count"]),
+                    str(delta["wrong_count"]),
+                    delta["last_result"],
                     now_str(),
-                ]
+                ])
+
+        for item in updates:
+            progress_sheet.update(
+                f"D{item['row_index']}:H{item['row_index']}",
+                [item["values"]],
             )
-            return
 
-        current_seen = int(float(str(progress_sheet.cell(target_row_index, 4).value or 0)))
-        current_correct = int(float(str(progress_sheet.cell(target_row_index, 5).value or 0)))
-        current_wrong = int(float(str(progress_sheet.cell(target_row_index, 6).value or 0)))
+        for row in appends:
+            progress_sheet.append_row(row)
 
-        new_seen = current_seen + 1
-        new_correct = current_correct + (1 if is_correct else 0)
-        new_wrong = current_wrong + (0 if is_correct else 1)
-        new_last_result = "correct" if is_correct else "wrong"
-
-        progress_sheet.update(
-            f"D{target_row_index}:H{target_row_index}",
-            [[
-                str(new_seen),
-                str(new_correct),
-                str(new_wrong),
-                new_last_result,
-                now_str(),
-            ]]
-        )
+        context.user_data["pending_progress_updates"] = {}
+        invalidate_progress_cache_for_user(user_id)
 
     except Exception as e:
-        logger.exception("update_word_progress error: %s", e)
+        logger.exception("flush_progress_updates error: %s", e)
 
 
 def build_weighted_words(words: list[dict], user_id: int, limit: int | None = None) -> list[dict]:
@@ -866,6 +987,7 @@ def build_rules_text():
         "Har bir so'zdan faqat 1 ta savol tushadi.\n"
         "Bu mashq rejimi hisoblanadi va ball qo'shilmaydi.\n"
         "Bot smart repetition mantiqidan foydalanadi: siz ko'proq xato qilgan so'zlar keyingi testlarda ko'proq tushadi.\n"
+        "Progress test davomida xotirada yig'iladi va test tugagach saqlanadi.\n"
         "Test tugagach, xato ishlangan savollarni alohida qayta ishlash mumkin.\n\n"
         "📘 Kitoblar bo'yicha testlar\n"
         "Bu bo'limda kitoblar ro'yxati 2 ustunli inline tugmalarda ko'rsatiladi.\n"
@@ -1008,6 +1130,7 @@ def clear_test_state(context: ContextTypes.DEFAULT_TYPE):
         "global_partial_saved",
         "current_book_id",
         "current_book_section",
+        "pending_progress_updates",
     ]:
         context.user_data.pop(key, None)
 
@@ -1046,6 +1169,9 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
     has_wrong_answers = bool(context.user_data.get("wrong_answers"))
 
     user_id, username, full_name = get_user_meta(update)
+
+    if test_mode_type in {"my", "my_retry"}:
+        flush_progress_updates(context, user_id)
 
     if test_mode_type == "global" and user_id is not None:
         save_global_result(user_id, username, full_name, total, correct)
@@ -1126,6 +1252,7 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
             "global_partial_saved",
             "current_book_id",
             "current_book_section",
+            "pending_progress_updates",
         ]:
             context.user_data.pop(key, None)
 
@@ -1135,6 +1262,10 @@ async def finish_test(query, context: ContextTypes.DEFAULT_TYPE, update: Update)
 # =========================
 async def restart_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_partial_global_result_if_needed(update, context)
+
+    user_id, _, _ = get_user_meta(update)
+    if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
+        flush_progress_updates(context, user_id)
 
     clear_test_state(context)
     context.user_data.pop("eng", None)
@@ -1159,6 +1290,10 @@ async def restart_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_partial_global_result_if_needed(update, context)
 
+    user_id, _, _ = get_user_meta(update)
+    if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
+        flush_progress_updates(context, user_id)
+
     clear_test_state(context)
     context.user_data.pop("eng", None)
     await update.message.reply_text(
@@ -1172,6 +1307,10 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_answer_callback(query)
 
     save_partial_global_result_if_needed(update, context)
+
+    user_id, _, _ = get_user_meta(update)
+    if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
+        flush_progress_updates(context, user_id)
 
     clear_test_state(context)
     context.user_data.pop("eng", None)
@@ -1397,6 +1536,10 @@ async def add_uzbek(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_partial_global_result_if_needed(update, context)
 
+    user_id, _, _ = get_user_meta(update)
+    if context.user_data.get("test_mode_type") in {"my", "my_retry"}:
+        flush_progress_updates(context, user_id)
+
     clear_test_state(context)
     context.user_data.pop("eng", None)
 
@@ -1469,6 +1612,7 @@ async def global_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["test_mode_type"] = "global"
     context.user_data["wrong_answers"] = []
     context.user_data["global_partial_saved"] = False
+    context.user_data["pending_progress_updates"] = {}
 
     await generate_question(update, context, query)
 
@@ -1502,6 +1646,7 @@ async def my_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["test_mode_type"] = "my"
     context.user_data["wrong_answers"] = []
     context.user_data["global_partial_saved"] = False
+    context.user_data["pending_progress_updates"] = {}
 
     await generate_question(update, context, query)
 
@@ -1529,6 +1674,7 @@ async def retry_wrong_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["test_mode_type"] = "my_retry"
     context.user_data["wrong_answers"] = []
     context.user_data["global_partial_saved"] = False
+    context.user_data["pending_progress_updates"] = {}
 
     await generate_question(update, context, query)
 
@@ -1587,6 +1733,7 @@ async def book_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["global_partial_saved"] = False
     context.user_data["current_book_id"] = book_id
     context.user_data["current_book_section"] = ""
+    context.user_data["pending_progress_updates"] = {}
 
     await generate_question(update, context, query)
 
@@ -1630,6 +1777,7 @@ async def book_section_test_handler(update: Update, context: ContextTypes.DEFAUL
     context.user_data["global_partial_saved"] = False
     context.user_data["current_book_id"] = book_id
     context.user_data["current_book_section"] = section
+    context.user_data["pending_progress_updates"] = {}
 
     await generate_question(update, context, query)
 
@@ -1817,7 +1965,8 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if test_mode_type in {"my", "my_retry"}:
         user_id, _, _ = get_user_meta(update)
         if user_id is not None:
-            update_word_progress(
+            add_progress_delta(
+                context=context,
                 user_id=user_id,
                 english=correct["english"],
                 uzbek=correct["uzbek"],
