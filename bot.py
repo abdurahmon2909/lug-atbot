@@ -490,7 +490,7 @@ def save_or_update_user(update: Update):
         return
 
     try:
-        records = get_users_records(force_refresh=True)
+        records = get_users_records()
 
         for idx, row in enumerate(records, start=2):
             row_user_id = normalize_text(str(row.get("user_id", "")))
@@ -1613,7 +1613,6 @@ async def restart_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
 
@@ -1629,7 +1628,6 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def leaderboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
 
@@ -1645,7 +1643,6 @@ async def leaderboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def rules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
 
@@ -1671,7 +1668,6 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
 
@@ -1780,7 +1776,6 @@ async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SO'Z QO'SHISH
 # =========================
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
     await safe_edit_or_send(query, "Inglizcha so'zni yozing:\n(Bekor qilish uchun /cancel yozing)")
@@ -1833,7 +1828,6 @@ async def add_uzbek(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     save_partial_global_result_if_needed(update, context)
 
     user_id, _, _ = get_user_meta(update)
@@ -1851,7 +1845,6 @@ async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # RO'YXATLAR
 # =========================
 async def my_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
 
@@ -1869,7 +1862,6 @@ async def my_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def global_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
 
@@ -1947,7 +1939,6 @@ async def my_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def retry_wrong_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
 
@@ -1971,7 +1962,6 @@ async def retry_wrong_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def repeat_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
 
@@ -2060,7 +2050,6 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # KITOBLAR
 # =========================
 async def books_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
 
@@ -2081,7 +2070,6 @@ async def books_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def book_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
 
@@ -2111,7 +2099,6 @@ async def book_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def book_sections_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
 
@@ -2144,7 +2131,6 @@ async def book_sections_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def book_section_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_or_update_user(update)
     query = update.callback_query
     await safe_answer_callback(query)
 
