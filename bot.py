@@ -71,6 +71,7 @@ TOP_LIMIT = 5
 GLOBAL_TEST_MAX_QUESTIONS = 25
 MY_TEST_MAX_QUESTIONS = 25
 BOOK_TEST_MAX_QUESTIONS = 25
+SECTION_WORDS_PAGE_SIZE = 20
 
 # =========================
 # CACHE
@@ -1026,6 +1027,7 @@ def build_weighted_words(words: list[dict], user_id: int, limit: int | None = No
             weight += 2
 
         weight = max(1, int(round(weight)))
+        weight = min(weight, 15)
 
         for _ in range(weight):
             pool.append(word)
@@ -1258,15 +1260,24 @@ def build_sections_grid_markup(book_id: str, sections: list[str]):
 
 
 def get_main_menu_markup() -> InlineKeyboardMarkup:
+    """Asosiy menyu - 4x2 format (8 ta tugma)"""
     keyboard = [
-        [InlineKeyboardButton("🌍 Global test", callback_data="global_test")],
-        [InlineKeyboardButton("👤 Mening testim", callback_data="my_test")],
-        [InlineKeyboardButton("➕ So'z qo'shish", callback_data="add")],
-        [InlineKeyboardButton("📚 Mening so'zlarim", callback_data="my_words_0")],
-        [InlineKeyboardButton("🌐 Global so'zlar", callback_data="global_words_0")],
-        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard_0")],
-        [InlineKeyboardButton("📘 Kitoblar bo'yicha testlar", callback_data="books_menu")],
-        [InlineKeyboardButton("ℹ️ Qoidalar", callback_data="rules")],
+        [
+            InlineKeyboardButton("🌍 Global test", callback_data="global_test"),
+            InlineKeyboardButton("👤 Mening testim", callback_data="my_test"),
+        ],
+        [
+            InlineKeyboardButton("➕ So'z qo'shish", callback_data="add"),
+            InlineKeyboardButton("📚 Mening so'zlarim", callback_data="my_words_0"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Global so'zlar", callback_data="global_words_0"),
+            InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard_0"),
+        ],
+        [
+            InlineKeyboardButton("📘 Kitoblar", callback_data="books_menu"),
+            InlineKeyboardButton("ℹ️ Qoidalar", callback_data="rules"),
+        ],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -2047,7 +2058,7 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# KITOBLAR
+# KITOBLAR (YANGI FUNKSIYALAR)
 # =========================
 async def books_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2080,7 +2091,9 @@ async def book_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
         return
 
-    buttons = [[InlineKeyboardButton("▶️ Kitob bo'yicha testni boshlash", callback_data=f"book_test::{book_id}")]]
+    buttons = [
+        [InlineKeyboardButton("▶️ Kitob bo'yicha testni boshlash", callback_data=f"book_test::{book_id}")]
+    ]
     if book["has_sections"]:
         buttons.append([InlineKeyboardButton("📂 Bo'limlar bo'yicha test", callback_data=f"book_sections::{book_id}")])
 
@@ -2131,6 +2144,7 @@ async def book_sections_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def book_section_open_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bo'lim sahifasi: So'zlar ro'yxati va Test tugmalari"""
     query = update.callback_query
     await safe_answer_callback(query)
 
@@ -2150,19 +2164,76 @@ async def book_section_open_handler(update: Update, context: ContextTypes.DEFAUL
     words = get_section_words(book_id, section)
     count = len(words)
 
+    # Ikki tugma: So'zlar ro'yxati va Test
     buttons = [
-        [InlineKeyboardButton("▶️ Bo'lim bo'yicha testni boshlash", callback_data=f"book_section_test::{book_id}::{parts[2]}")],
-        [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"book_sections::{book_id}")],
+        [InlineKeyboardButton("📖 So'zlar ro'yxati", callback_data=f"book_section_words::{book_id}::{parts[2]}::0")],
+        [InlineKeyboardButton("▶️ Testni boshlash", callback_data=f"book_section_test::{book_id}::{parts[2]}")],
+        [InlineKeyboardButton("⬅️ Bo'limlar", callback_data=f"book_sections::{book_id}")],
         [InlineKeyboardButton("🏠 Menyu", callback_data="menu")],
     ]
 
     text = (
         f"📂 {book['book_name']} — {section}\n\n"
         f"📚 Shu bo'limdagi so'zlar: {count}\n\n"
-        "Testni boshlash uchun tugmani bosing."
+        "Kerakli amalni tanlang:"
     )
 
     await safe_edit_or_send(query, text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def book_section_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bo'lim so'zlarini sahifalab ko'rsatish (20 tadan)"""
+    query = update.callback_query
+    await safe_answer_callback(query)
+
+    parts = query.data.split("::")
+    if len(parts) != 4:
+        await safe_edit_or_send(query, "Xatolik.", reply_markup=get_main_menu_markup())
+        return
+
+    book_id = parts[1]
+    section = parts[2].replace("_", " ")
+    page = int(parts[3])
+
+    book = get_book_by_id(book_id)
+    if not book:
+        await safe_edit_or_send(query, "Kitob topilmadi.", reply_markup=get_main_menu_markup())
+        return
+
+    words = get_section_words(book_id, section)
+    page_size = SECTION_WORDS_PAGE_SIZE
+    total_pages = max(1, (len(words) + page_size - 1) // page_size)
+
+    if page < 0:
+        page = 0
+    if page >= total_pages:
+        page = total_pages - 1
+
+    start = page * page_size
+    end = min(start + page_size, len(words))
+    chunk = words[start:end]
+
+    text = f"📖 {book['book_name']} — {section}\n"
+    text += f"📄 Sahifa {page + 1}/{total_pages}\n"
+    text += f"📚 Jami so'zlar: {len(words)}\n\n"
+
+    for idx, word in enumerate(chunk, start=start + 1):
+        text += f"{idx}. {word['english']} - {word['uzbek']}\n"
+
+    # Pagination tugmalari
+    keyboard = []
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️ Oldingi", callback_data=f"book_section_words::{book_id}::{parts[2]}::{page - 1}"))
+    if page < total_pages - 1:
+        row.append(InlineKeyboardButton("➡️ Keyingi", callback_data=f"book_section_words::{book_id}::{parts[2]}::{page + 1}"))
+    if row:
+        keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton("◀️ Bo'limga qaytish", callback_data=f"book_section_open::{book_id}::{parts[2]}")])
+    keyboard.append([InlineKeyboardButton("🏠 Menyu", callback_data="menu")])
+
+    await safe_edit_or_send(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def book_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2331,6 +2402,7 @@ def main():
     app.add_handler(CallbackQueryHandler(book_open_handler, pattern=r"^book_open::"))
     app.add_handler(CallbackQueryHandler(book_sections_handler, pattern=r"^book_sections::"))
     app.add_handler(CallbackQueryHandler(book_section_open_handler, pattern=r"^book_section_open::"))
+    app.add_handler(CallbackQueryHandler(book_section_words_handler, pattern=r"^book_section_words::"))
     app.add_handler(CallbackQueryHandler(book_test_handler, pattern=r"^book_test::"))
     app.add_handler(CallbackQueryHandler(book_section_test_handler, pattern=r"^book_section_test::"))
 
